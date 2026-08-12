@@ -14,7 +14,8 @@ import {getSiteTimezone} from '@tryghost/admin-x-framework/utils/get-site-timezo
 import {useBrowseNewsletters} from '@tryghost/admin-x-framework/api/newsletters';
 import {useBrowseOffers} from '@tryghost/admin-x-framework/api/offers';
 import {useFeatureFlag} from '@tryghost/admin-x-framework/hooks';
-import {useBrowseMemberCustomFields} from '@tryghost/admin-x-framework/api/member-custom-fields';
+import {useBrowseMemberCustomFieldsIncludingArchived} from '@tryghost/admin-x-framework/api/member-custom-fields';
+import type {MemberCustomField} from '@tryghost/admin-x-framework/api/member-custom-fields';
 import {useEmailPostValueSource, useLabelValueSource, usePostResourceValueSource, useTierValueSource} from '@/shared/filter-sources';
 import type {MemberView} from '@/members/hooks/use-member-views';
 
@@ -29,6 +30,7 @@ interface MembersFiltersProps {
 }
 
 const EMPTY_OFFERS: typeof buildOfferOptions extends (offers: infer T) => unknown ? T : never = [];
+const EMPTY_CUSTOM_FIELDS: MemberCustomField[] = [];
 
 function mapOfferRedemptionFilters(
     filters: Filter[],
@@ -96,8 +98,23 @@ const MembersFilters: React.FC<MembersFiltersProps> = ({
     const labelValueSource = useLabelValueSource();
     const {valueSource: tierValueSource, hasMultipleTiers} = useTierValueSource();
     const customFieldsEnabled = useFeatureFlag('membersCustomFields');
-    const {data: customFieldsData} = useBrowseMemberCustomFields({enabled: customFieldsEnabled});
-    const customFields = customFieldsData?.members_custom_fields ?? [];
+    // Include-archived so a segment referencing an archived field can still render its
+    // (disabled) pill; the picker itself is filtered back to active fields below.
+    const {data: customFieldsData} = useBrowseMemberCustomFieldsIncludingArchived({enabled: customFieldsEnabled});
+    const allCustomFields = customFieldsData?.members_custom_fields ?? EMPTY_CUSTOM_FIELDS;
+    const customFields = useMemo(() => allCustomFields.filter(field => field.status === 'active'), [allCustomFields]);
+    const referencedCustomFieldKeys = useMemo(() => new Set(
+        filters
+            .map(filter => filter.field)
+            .filter(field => field.startsWith('custom_field.'))
+            .map(field => field.slice('custom_field.'.length))
+            .filter(Boolean)
+    ), [filters]);
+    // Only archived fields the current filter actually references become pills; the
+    // picker's de-dup then keeps them out of the add-list since their key is applied.
+    const archivedCustomFields = useMemo(() => allCustomFields
+        .filter(field => field.status === 'archived' && referencedCustomFieldKeys.has(field.key))
+        .map(field => ({key: field.key, name: field.name})), [allCustomFields, referencedCustomFieldKeys]);
 
     const filterFields = useMemberFilterFields({
         newsletters,
@@ -116,7 +133,8 @@ const MembersFilters: React.FC<MembersFiltersProps> = ({
         emailTrackClicks,
         siteTimezone,
         customFieldsEnabled,
-        customFields
+        customFields,
+        archivedCustomFields
     });
 
     const hasFilters = filters.length > 0;

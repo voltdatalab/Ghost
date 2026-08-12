@@ -1,6 +1,6 @@
 import {useMemo, useState} from 'react';
 import {act, fireEvent, render, screen, waitFor} from '../../utils/test-utils';
-import {afterEach, beforeAll, describe, expect, it, vi} from 'vitest';
+import {afterAll, afterEach, beforeAll, describe, expect, it, vi} from 'vitest';
 import {createFilter, Filter, FilterFieldConfig, Filters, ValueSource} from '../../../../src/components/patterns/filters';
 
 vi.mock('@/components/ui/calendar', () => ({
@@ -438,6 +438,9 @@ describe('Filters', () => {
     });
 
     describe('group previewLimit', () => {
+        const originalResizeObserver = global.ResizeObserver;
+        const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
+
         beforeAll(() => {
             global.ResizeObserver = class {
                 observe() {
@@ -453,6 +456,11 @@ describe('Filters', () => {
                 }
             } as unknown as typeof ResizeObserver;
             HTMLElement.prototype.scrollIntoView = vi.fn();
+        });
+
+        afterAll(() => {
+            global.ResizeObserver = originalResizeObserver;
+            HTMLElement.prototype.scrollIntoView = originalScrollIntoView;
         });
 
         function PreviewLimitFilters({previewLimit}: Readonly<{previewLimit?: number}>) {
@@ -519,6 +527,161 @@ describe('Filters', () => {
 
             expect(await screen.findByRole('option', {name: 'Field 8'})).toBeDefined();
             expect(screen.queryByRole('option', {name: /Show \d+ more/})).toBeNull();
+        });
+    });
+
+    describe('disabled fields and group empty state', () => {
+        const originalResizeObserver = global.ResizeObserver;
+        const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
+
+        beforeAll(() => {
+            global.ResizeObserver = class {
+                observe() {
+                    return undefined;
+                }
+
+                unobserve() {
+                    return undefined;
+                }
+
+                disconnect() {
+                    return undefined;
+                }
+            } as unknown as typeof ResizeObserver;
+            HTMLElement.prototype.scrollIntoView = vi.fn();
+        });
+
+        afterAll(() => {
+            global.ResizeObserver = originalResizeObserver;
+            HTMLElement.prototype.scrollIntoView = originalScrollIntoView;
+        });
+
+        function ReadOnlyFieldFilters() {
+            const [filters, setFilters] = useState<Filter<string>[]>([createFilter('custom_field.archived', 'is', ['London'])]);
+            const fields = useMemo(() => ([
+                {
+                    group: 'Custom fields',
+                    fields: [{
+                        key: 'custom_field.archived',
+                        label: 'Archived field',
+                        type: 'text' as const,
+                        readOnly: true,
+                        operators: [{value: 'is', label: 'is'}]
+                    }]
+                }
+            ]), []);
+
+            return <Filters fields={fields} filters={filters} showSearchInput={true} onChange={setFilters} />;
+        }
+
+        function OnlyEmptyGroupFilters() {
+            const [filters, setFilters] = useState<Filter<string>[]>([]);
+            const fields = useMemo(() => ([{
+                group: 'Custom fields',
+                fields: [],
+                emptyState: <span>Configure custom fields in Settings</span>
+            }]), []);
+
+            return <Filters addButtonText="Add filter" fields={fields} filters={filters} onChange={setFilters} />;
+        }
+
+        it('opens the picker for a group that has only an empty state to show', () => {
+            render(<OnlyEmptyGroupFilters />);
+
+            // The one case an empty state exists for is every group being empty, so the
+            // picker has to be reachable with no selectable field anywhere.
+            fireEvent.click(screen.getByRole('button', {name: 'Add filter'}));
+            expect(screen.getByText('Configure custom fields in Settings')).toBeDefined();
+        });
+
+        function ReadOnlyPickerFilters() {
+            const [filters, setFilters] = useState<Filter<string>[]>([createFilter('custom_field.archived', 'is', ['London'])]);
+            const fields = useMemo(() => ([
+                {
+                    group: 'Custom fields',
+                    fields: [
+                        {
+                            key: 'custom_field.archived',
+                            label: 'Archived field',
+                            type: 'text' as const,
+                            readOnly: true,
+                            operators: [{value: 'is', label: 'is'}]
+                        },
+                        {
+                            key: 'custom_field.active',
+                            label: 'Active field',
+                            type: 'text' as const,
+                            operators: [{value: 'is', label: 'is'}]
+                        }
+                    ]
+                }
+            ]), []);
+
+            // allowMultiple is what a caller passes to let one field carry several filters.
+            // It skips the applied-field de-dup, so it is the case where a read-only field
+            // would otherwise reappear in the picker while its own pill is on screen.
+            return <Filters addButtonText="Add filter" allowMultiple={true} fields={fields} filters={filters} showSearchInput={true} onChange={setFilters} />;
+        }
+
+        it('never offers a read-only field in the picker, even where a field may repeat', () => {
+            render(<ReadOnlyPickerFilters />);
+            fireEvent.click(screen.getByRole('button', {name: 'Add filter'}));
+
+            // The one that can be filtered on is offered...
+            expect(screen.getByRole('option', {name: 'Active field'})).toBeDefined();
+            // ...the read-only one is not: picking it would mint a second filter that could
+            // never be edited. Its existing pill is still on screen.
+            expect(screen.queryByRole('option', {name: 'Archived field'})).toBeNull();
+        });
+
+        function ReadOnlyOptionLabelFilters() {
+            const [filters, setFilters] = useState<Filter<string>[]>([createFilter('tier', 'is', ['t1'])]);
+            const fields = useMemo(() => ([{
+                key: 'tier',
+                label: 'Tier',
+                type: 'select' as const,
+                readOnly: true,
+                operators: [{value: 'is', label: 'is'}],
+                options: [{value: 't1', label: 'Gold'}]
+            }]), []);
+
+            return <Filters fields={fields} filters={filters} onChange={setFilters} />;
+        }
+
+        it('reads a read-only value through its option label, as the editable one does', () => {
+            render(<ReadOnlyOptionLabelFilters />);
+
+            expect(screen.getByText('Gold')).toBeDefined();
+            expect(screen.queryByText('t1')).toBeNull();
+        });
+
+        it('renders a read-only field showing its operator and value as static, non-editable text', () => {
+            render(<ReadOnlyFieldFilters />);
+
+            expect(screen.getByText('Archived field')).toBeDefined();
+            // Operator and value stay visible so the filter reads clearly...
+            expect(screen.getByText('is')).toBeDefined();
+            expect(screen.getByText('London')).toBeDefined();
+            // ...but there is nothing to edit: no input and no operator menu button.
+            expect(screen.queryByRole('textbox')).toBeNull();
+            expect(screen.queryByRole('button', {name: 'is'})).toBeNull();
+        });
+
+        function EmptyStateFilters() {
+            const [filters, setFilters] = useState<Filter<string>[]>([]);
+            const fields = useMemo(() => ([
+                {group: 'Basic', fields: [{key: 'name', label: 'Name', type: 'text' as const, operators: [{value: 'is', label: 'is'}]}]},
+                {group: 'Custom fields', fields: [], emptyState: <div>Configure custom fields in Settings</div>}
+            ]), []);
+
+            return <Filters addButtonText="Add filter" fields={fields} filters={filters} showSearchInput={true} onChange={setFilters} />;
+        }
+
+        it('shows a group empty state in the picker when the group has no fields', async () => {
+            render(<EmptyStateFilters />);
+            fireEvent.click(screen.getByRole('button', {name: 'Add filter'}));
+
+            expect(await screen.findByText('Configure custom fields in Settings')).toBeDefined();
         });
     });
 });
