@@ -20,9 +20,11 @@ transactions, or Stripe objects.
 - `getMemberPresentations(memberIds)`, `getPreview(token)`,
   `browsePurchaseEvents(...)`, and `browseRedemptionEvents(...)` expose
   stable read models.
-- `processReminders()`, `processConsumed()`, and `processExpired()` own due
-  lifecycle work; scheduler and HTTP triggers remain adapters.
+- `sendDelivery(id)`, `processReminders()`, `processConsumed()`, and
+  `processExpired()` own lifecycle work. Email delivery starts immediately after
+  purchase through an in-process event. Delivery claims are atomic and each
+  delivery makes one Mailgun acceptance attempt.
 - `reassignRedeemer(...)` is the import capability.
 
-The `Gift`, repository, Bookshelf query, Stripe checkout, email, scheduling,
-and notification collaborators are internal adapters.
+The `Gift` and `GiftDelivery` models, their repositories, Bookshelf queries,
+Stripe checkout and email collaborators are internal adapters.

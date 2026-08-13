@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import sinon from 'sinon';
 import type {Knex} from 'knex';
-import {GiftBookshelfRepository} from '../../../../../core/server/services/gifts/gift-bookshelf-repository';
+import {GiftBookshelfRepository, toDatabaseDate} from '../../../../../core/server/services/gifts/gift-bookshelf-repository';
 import {Gift} from '../../../../../core/server/services/gifts/gift';
 
 type GiftBookshelfModel = ConstructorParameters<typeof GiftBookshelfRepository>[0]['GiftModel'];
@@ -47,6 +47,11 @@ describe('GiftBookshelfRepository', function () {
 
     afterEach(function () {
         sinon.restore();
+    });
+
+    it('formats delivery attempt timestamps as UTC database timestamps', function () {
+        assert.equal(toDatabaseDate(new Date('2026-08-05T12:00:00.000Z')), '2026-08-05 12:00:00');
+        assert.equal(toDatabaseDate(new Date('2026-08-05T23:45:30.999Z')), '2026-08-05 23:45:30');
     });
 
     it('returns a Gift when a token matches', async function () {
@@ -164,6 +169,64 @@ describe('GiftBookshelfRepository', function () {
         const gift = await repository.getByToken('missing-token');
 
         assert.equal(gift, null);
+    });
+
+    it('returns the persisted id when creating a gift', async function () {
+        const GiftModel = {
+            add: sinon.stub().resolves({
+                toJSON: () => ({id: 'gift_1'})
+            }),
+            transaction: sinon.stub(),
+            findOne: sinon.stub(),
+            findAll: sinon.stub()
+        };
+        const repository = createRepository(GiftModel);
+        const gift = Gift.fromPurchase({
+            token: 'gift-token',
+            buyerEmail: 'buyer@example.com',
+            buyerMemberId: null,
+            tierId: 'tier_1',
+            cadence: 'year',
+            duration: 1,
+            currency: 'usd',
+            amount: 5000,
+            stripeCheckoutSessionId: 'cs_123',
+            stripePaymentIntentId: 'pi_456'
+        });
+
+        const id = await repository.create(gift, {transacting});
+
+        assert.equal(id, 'gift_1');
+        sinon.assert.calledOnce(GiftModel.add);
+        assert.equal(GiftModel.add.firstCall.args[1].transacting, 'trx');
+    });
+
+    it('rejects a created gift without a persisted id', async function () {
+        const GiftModel = {
+            add: sinon.stub().resolves({
+                toJSON: () => ({})
+            }),
+            transaction: sinon.stub(),
+            findOne: sinon.stub(),
+            findAll: sinon.stub()
+        };
+        const repository = createRepository(GiftModel);
+        const gift = Gift.fromPurchase({
+            token: 'gift-token',
+            buyerEmail: 'buyer@example.com',
+            buyerMemberId: null,
+            tierId: 'tier_1',
+            cadence: 'year',
+            duration: 1,
+            currency: 'usd',
+            amount: 5000,
+            stripeCheckoutSessionId: 'cs_123',
+            stripePaymentIntentId: 'pi_456'
+        });
+
+        await assert.rejects(() => repository.create(gift), {
+            message: 'Created gift is missing an id'
+        });
     });
 
     it('updates an existing gift', async function () {
