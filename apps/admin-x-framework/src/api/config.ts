@@ -118,10 +118,6 @@ export type Config = {
     security?: {
         staffDeviceVerification?: boolean;
     };
-    // Capability signal: this Ghost serves GET /exports/download/
-    exports?: {
-        download?: boolean;
-    };
     featurebase?: {
         enabled?: boolean;
         organization?: string;
