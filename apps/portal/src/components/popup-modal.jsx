@@ -3,7 +3,7 @@ import Frame from './frame';
 import {hasMode} from '../utils/check-mode';
 import AppContext from '../app-context';
 import {getFrameStyles} from './frame.styles';
-import Pages, {getActivePage} from '../pages';
+import {getActivePage, getPages} from '../pages';
 import PopupNotification from './common/popup-notification';
 import PoweredBy from './common/powered-by';
 import {getSiteProducts, hasAvailablePrices, isInviteOnly, isCookiesDisabled, hasFreeProductPrice} from '../utils/helpers';
@@ -117,8 +117,9 @@ class PopupContent extends React.Component {
     }
 
     renderActivePage() {
-        const {page} = this.context;
+        const {page, site} = this.context;
         getActivePage({page});
+        const Pages = getPages({site});
         const PageComponent = Pages[page];
 
         return (
@@ -267,6 +268,7 @@ export default class PopupModal extends React.Component {
     }
 
     renderCurrentPage(page) {
+        const Pages = getPages({site: this.context.site});
         const PageComponent = Pages[page];
 
         return (
