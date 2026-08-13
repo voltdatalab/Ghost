@@ -1,4 +1,5 @@
-import {DATE_FILTER_OPERATORS, DEFAULT_DATE_OPERATOR, type FilterCodec, dateCodec, defineFields, extractComparator, numberCodec, scalarCodec, setCodec, textCodec, withFutureRelativeOperator, withPastRelativeOperator} from '@/shared/filters';
+import {CUSTOM_FIELD_SET_OPERATORS, customFieldAddressing} from './custom-field-addressing';
+import {DATE_FILTER_OPERATORS, DEFAULT_DATE_OPERATOR, type FilterCodec, composeCodec, dateCodec, defineFields, extractComparator, numberCodec, scalarCodec, setCodec, textCodec, textSemantics, withFutureRelativeOperator, withPastRelativeOperator} from '@/shared/filters';
 import {escapeNqlString} from '@tryghost/nql-string';
 import {MULTIPLE_ACTIVE_STRIPE_CUSTOMERS_FIELD, MULTIPLE_ACTIVE_STRIPE_CUSTOMERS_FILTER, NO_MULTIPLE_ACTIVE_STRIPE_CUSTOMERS_FILTER} from './multiple-active-subscriptions';
 
@@ -6,6 +7,12 @@ const TEXT_OPERATORS = ['is', 'contains', 'does-not-contain', 'starts-with', 'en
 const NUMBER_OPERATORS = ['is', 'is-greater', 'is-less'] as const;
 const SCALAR_OPERATORS = ['is', 'is-not'] as const;
 const SET_OPERATORS = ['is-any', 'is-not-any'] as const;
+
+/** The members of `source` that `exclude` does not already list, keeping `source`'s type. */
+function excluding<TValue extends string>(source: readonly TValue[], exclude: readonly string[]): TValue[] {
+    return source.filter(value => !exclude.includes(value));
+}
+
 const SUBSCRIPTION_STATUS_OPTIONS: Array<{value: string; label: string}> = [
     {value: 'active', label: 'Active'},
     {value: 'trialing', label: 'Trialing'},
@@ -90,7 +97,7 @@ const feedbackCodec: FilterCodec = {
 
 const multipleActiveSubscriptionsCodec: FilterCodec = {
     parse(node, ctx) {
-        const comparator = extractComparator(node as Record<string, unknown>);
+        const comparator = extractComparator(node);
 
         if (!comparator || comparator.field !== ctx.key) {
             return null;
@@ -133,79 +140,21 @@ const multipleActiveSubscriptionsCodec: FilterCodec = {
     }
 };
 
-// Presence operators: the extra an optional, per-member field has that a table column does
-// not — a column is always set, so no built-in field offers these.
-export const CUSTOM_FIELD_SET_OPERATORS: readonly string[] = ['is-set', 'is-not-set'];
-
-// A custom text field's operators, composed from the shared groups so the members filter
-// keeps one vocabulary: the equality pair (is / is-not) the scalar fields use, then the
-// text matching operators (contains, starts-with, …) with their duplicate `is` dropped,
-// then presence. Labels come from the shared createOperatorOptions default (dash to space),
+// A custom text field's operators: the equality pair and the text matching operators the
+// shared text vocabulary expresses, then the presence pair its addressing adds. Composed
+// from the same lists the column-backed fields declare, so the members filter keeps one
+// vocabulary. Labels come from the shared createOperatorOptions default (dash to space),
 // which reads every one of these correctly, so no label map is needed.
 export const CUSTOM_FIELD_OPERATORS: readonly string[] = [
     ...SCALAR_OPERATORS,
-    ...TEXT_OPERATORS.filter(op => !(SCALAR_OPERATORS as readonly string[]).includes(op)),
+    ...excluding(TEXT_OPERATORS, SCALAR_OPERATORS),
     ...CUSTOM_FIELD_SET_OPERATORS
 ];
 
-// NQL operator symbol for each value operator. The field is named in the value
-// position (`custom_fields.key:'…'`) so its key can carry hyphens; the value is
-// matched on `custom_fields.value` (scalar) or `custom_fields.value.<subfield>`
-// (address), which the members filter relation maps onto the real columns.
-const CUSTOM_FIELD_VALUE_SYMBOLS: Record<string, string> = {
-    is: '',
-    'is-not': '-',
-    contains: '~',
-    'does-not-contain': '-~',
-    'starts-with': '~^',
-    'ends-with': '~$'
-};
-
-const customFieldsCodec: FilterCodec = {
-    // Parsing a grouped custom-field expression back to a predicate is bespoke —
-    // its field and part are spread across a `(key + value)` pair — so it's handled
-    // by a compound matcher in member-filter-query.ts, not here.
-    parse() {
-        return null;
-    },
-    // The field's stable key comes from the dropdown entry (`custom_field.<key>`,
-    // resolved into `ctx.params.key`); the predicate carries only [subfield, value],
-    // with subfield '' for a scalar field or the "Any" (whole-field set/unset) case.
-    serialize(predicate, ctx) {
-        const fieldKey = ctx.params.key;
-        const [subfield, value] = predicate.values as [string, string];
-
-        if (!fieldKey) {
-            return null;
-        }
-
-        const keyClause = `custom_fields.key:${escapeNqlString(fieldKey)}`;
-
-        // set / not-set target a part's presence when a part is chosen (`path`), or the
-        // whole field otherwise (the bare key / its negation).
-        if (predicate.operator === 'is-set') {
-            return subfield
-                ? [`(${keyClause}+custom_fields.path:${escapeNqlString(subfield)})`]
-                : [keyClause];
-        }
-
-        if (predicate.operator === 'is-not-set') {
-            return subfield
-                ? [`(${keyClause}+custom_fields.path:-${escapeNqlString(subfield)})`]
-                : [`custom_fields.key:-${escapeNqlString(fieldKey)}`];
-        }
-
-        const symbol = CUSTOM_FIELD_VALUE_SYMBOLS[predicate.operator];
-
-        if (symbol === undefined || value === undefined || value === null || value === '') {
-            return null;
-        }
-
-        const valueKey = subfield ? `custom_fields.value.${subfield}` : 'custom_fields.value';
-
-        return [`(${keyClause}+${valueKey}:${symbol}${escapeNqlString(String(value))})`];
-    }
-};
+// Ordinary text comparison, reached through the custom fields relation rather than a
+// column. Neither half is written here: the grammar is in custom-field-addressing.ts and
+// the vocabulary is the same one member name and email use.
+const customFieldsCodec: FilterCodec = composeCodec(customFieldAddressing(), textSemantics());
 
 const baseMemberFields = defineFields({
     name: {

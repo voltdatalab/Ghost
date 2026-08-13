@@ -1,3 +1,5 @@
+import type {AstNode} from './filter-ast';
+
 export interface FilterPredicate {
     id: string;
     field: string;
@@ -15,8 +17,14 @@ export interface CodecContext {
 }
 
 export interface FilterCodec {
-    parse: (node: unknown, ctx: CodecContext) => ParsedPredicate | null;
+    parse: (node: AstNode, ctx: CodecContext) => ParsedPredicate | null;
     serialize: (predicate: FilterPredicate, ctx: CodecContext) => string[] | null;
+    /**
+     * A grouped node whose field key is carried in a clause value rather than the node's
+     * key, so the key-based dispatch cannot route it. Tried before that dispatch, and it
+     * names the predicate's field itself.
+     */
+    parseCompound?: (node: AstNode, ctx: CodecContext) => ParsedPredicate | null;
 }
 
 export interface FilterField {

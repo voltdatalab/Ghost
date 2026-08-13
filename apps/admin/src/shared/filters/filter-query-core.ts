@@ -1,4 +1,5 @@
 import nql from '@tryghost/nql-lang';
+import {isAstNode} from './filter-ast';
 import {resolveField} from './resolve-field';
 import type {AstNode} from './filter-ast';
 import type {FilterField, FilterPredicate, ParsedPredicate} from './filter-types';
@@ -47,11 +48,32 @@ export function hasFieldKey(node: AstNode, fieldKeys: ReadonlySet<string>): bool
 
     return Object.values(node).some((value) => {
         if (Array.isArray(value)) {
-            return value.some(child => child !== null && typeof child === 'object' && hasFieldKey(child as AstNode, fieldKeys));
+            return value.some(child => isAstNode(child) && hasFieldKey(child, fieldKeys));
         }
 
-        return value !== null && typeof value === 'object' && !(value instanceof RegExp) && hasFieldKey(value as AstNode, fieldKeys);
+        return isAstNode(value) && hasFieldKey(value, fieldKeys);
     });
+}
+
+/**
+ * Fields whose NQL names their key in a clause value cannot be reached by the key-based
+ * dispatch below, so their codecs recognise a whole node themselves. Tried before it.
+ */
+export function dispatchCompoundNode<TFields extends Record<string, FilterField>>(node: AstNode, fields: TFields, timezone: string): ParsedPredicate | null {
+    for (const [pattern, definition] of Object.entries(fields)) {
+        const parsed = definition.codec.parseCompound?.(node, {
+            key: pattern,
+            pattern,
+            params: {},
+            timezone
+        });
+
+        if (parsed) {
+            return parsed;
+        }
+    }
+
+    return null;
 }
 
 export function dispatchSimpleNodes<TFields extends Record<string, FilterField>>(nodes: AstNode[], fields: TFields, timezone: string): ParsedPredicate[] {

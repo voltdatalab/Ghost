@@ -1,8 +1,10 @@
 // Filter AST / codec engine — shared across posts, comments and members domains.
 
 export * from './create-relative-date-renderer';
+export * from './filter-addressing';
 export * from './filter-ast';
 export * from './filter-codecs';
+export * from './filter-semantics';
 export * from './filter-date';
 export * from './filter-normalization';
 export * from './filter-operator-options';

@@ -1,7 +1,19 @@
-import nql from '@tryghost/nql-lang';
 import {dateCodec, numberCodec, scalarCodec, setCodec, textCodec} from './filter-codecs';
+import {parseFilterToAst} from './filter-query-core';
 import {describe, expect, it} from 'vitest';
 import type {CodecContext, FilterPredicate} from './filter-types';
+
+// The engine's own entry point rather than the raw parser, so these read the same node
+// shape the app does — and so a codec's input stays typed instead of asserted.
+function ast(filter: string) {
+    const node = parseFilterToAst(filter);
+
+    if (!node) {
+        throw new Error(`could not parse: ${filter}`);
+    }
+
+    return node;
+}
 
 const statusContext: CodecContext = {
     key: 'status',
@@ -61,12 +73,12 @@ const dateContext: CodecContext = {
 
 describe('scalarCodec', () => {
     it('parses simple scalar comparisons', () => {
-        expect(scalarCodec().parse(nql.parse('status:paid') as never, statusContext)).toEqual({
+        expect(scalarCodec().parse(ast('status:paid'), statusContext)).toEqual({
             field: 'status',
             operator: 'is',
             values: ['paid']
         });
-        expect(scalarCodec().parse(nql.parse('status:-paid') as never, statusContext)).toEqual({
+        expect(scalarCodec().parse(ast('status:-paid'), statusContext)).toEqual({
             field: 'status',
             operator: 'is-not',
             values: ['paid']
@@ -98,7 +110,7 @@ describe('scalarCodec', () => {
     it('supports mapped NQL field names', () => {
         const authorCodec = scalarCodec({field: 'member_id'});
 
-        expect(authorCodec.parse(nql.parse('member_id:abc123') as never, authorContext)).toEqual({
+        expect(authorCodec.parse(ast('member_id:abc123'), authorContext)).toEqual({
             field: 'author',
             operator: 'is',
             values: ['abc123']
@@ -140,12 +152,12 @@ describe('scalarCodec', () => {
 
 describe('textCodec', () => {
     it('parses regex-based text operators', () => {
-        expect(textCodec().parse(nql.parse('email:~\'ghost\'') as never, emailContext)).toEqual({
+        expect(textCodec().parse(ast('email:~\'ghost\''), emailContext)).toEqual({
             field: 'email',
             operator: 'contains',
             values: ['ghost']
         });
-        expect(textCodec().parse(nql.parse('email:-~$\'ghost\'') as never, emailContext)).toEqual({
+        expect(textCodec().parse(ast('email:-~$\'ghost\''), emailContext)).toEqual({
             field: 'email',
             operator: 'does-not-end-with',
             values: ['ghost']
@@ -153,13 +165,13 @@ describe('textCodec', () => {
     });
 
     it('preserves regex escape sequences while unescaping literal punctuation', () => {
-        expect(textCodec().parse(nql.parse('email:~\'g.ost\'') as never, emailContext)).toEqual({
+        expect(textCodec().parse(ast('email:~\'g.ost\''), emailContext)).toEqual({
             field: 'email',
             operator: 'contains',
             values: ['g.ost']
         });
 
-        expect(textCodec().parse(nql.parse('email:~\'\\d\'') as never, emailContext)).toEqual({
+        expect(textCodec().parse(ast('email:~\'\\d\''), emailContext)).toEqual({
             field: 'email',
             operator: 'contains',
             values: ['\\d']
@@ -167,7 +179,7 @@ describe('textCodec', () => {
     });
 
     it('parses and serializes exact text operators', () => {
-        expect(textCodec().parse(nql.parse('email:\'ghost@example.com\'') as never, emailContext)).toEqual({
+        expect(textCodec().parse(ast('email:\'ghost@example.com\''), emailContext)).toEqual({
             field: 'email',
             operator: 'is',
             values: ['ghost@example.com']
@@ -194,7 +206,22 @@ describe('textCodec', () => {
         expect(textCodec().serialize(predicate, emailContext)).toEqual(['email:~^\'can\\\'t\'']);
     });
 
-    it('returns null for invalid text operators', () => {
+    it('returns null for operators outside the text vocabulary', () => {
+        const predicate: FilterPredicate = {
+            id: '1',
+            field: 'email',
+            operator: 'is-greater',
+            values: ['ghost']
+        };
+
+        expect(textCodec().serialize(predicate, emailContext)).toBeNull();
+    });
+
+    // The text vocabulary owns the equality pair, so `is-not` serializes here even though
+    // member name and email do not offer it. Which operators a field advertises is its own
+    // declaration (`FilterField.operators`), gated at the call site by `isPredicateEnabled`
+    // — the codec's job is to express the ones it is given.
+    it('serializes the equality pair the vocabulary supports', () => {
         const predicate: FilterPredicate = {
             id: '1',
             field: 'email',
@@ -202,7 +229,7 @@ describe('textCodec', () => {
             values: ['ghost']
         };
 
-        expect(textCodec().serialize(predicate, emailContext)).toBeNull();
+        expect(textCodec().serialize(predicate, emailContext)).toEqual(['email:-\'ghost\'']);
     });
 
     it('does not serialize empty text values', () => {
@@ -219,7 +246,7 @@ describe('textCodec', () => {
     it('supports mapped NQL field names', () => {
         const bodyCodec = textCodec({field: 'html'});
 
-        expect(bodyCodec.parse(nql.parse('html:~\'ghost\'') as never, bodyContext)).toEqual({
+        expect(bodyCodec.parse(ast('html:~\'ghost\''), bodyContext)).toEqual({
             field: 'body',
             operator: 'contains',
             values: ['ghost']
@@ -236,12 +263,12 @@ describe('textCodec', () => {
 
 describe('setCodec', () => {
     it('parses set membership operators', () => {
-        expect(setCodec().parse(nql.parse('label:[vip,alpha]') as never, labelContext)).toEqual({
+        expect(setCodec().parse(ast('label:[vip,alpha]'), labelContext)).toEqual({
             field: 'label',
             operator: 'is-any',
             values: ['vip', 'alpha']
         });
-        expect(setCodec().parse(nql.parse('label:-[vip,alpha]') as never, labelContext)).toEqual({
+        expect(setCodec().parse(ast('label:-[vip,alpha]'), labelContext)).toEqual({
             field: 'label',
             operator: 'is-not-any',
             values: ['vip', 'alpha']
@@ -249,12 +276,12 @@ describe('setCodec', () => {
     });
 
     it('parses singleton set values through scalar NQL operators', () => {
-        expect(setCodec().parse(nql.parse('label:vip') as never, labelContext)).toEqual({
+        expect(setCodec().parse(ast('label:vip'), labelContext)).toEqual({
             field: 'label',
             operator: 'is-any',
             values: ['vip']
         });
-        expect(setCodec().parse(nql.parse('label:-vip') as never, labelContext)).toEqual({
+        expect(setCodec().parse(ast('label:-vip'), labelContext)).toEqual({
             field: 'label',
             operator: 'is-not-any',
             values: ['vip']
@@ -297,12 +324,12 @@ describe('setCodec', () => {
 
 describe('numberCodec', () => {
     it('parses numeric comparison operators', () => {
-        expect(numberCodec().parse(nql.parse('email_count:>5') as never, countContext)).toEqual({
+        expect(numberCodec().parse(ast('email_count:>5'), countContext)).toEqual({
             field: 'email_count',
             operator: 'is-greater',
             values: [5]
         });
-        expect(numberCodec().parse(nql.parse('email_count:10') as never, countContext)).toEqual({
+        expect(numberCodec().parse(ast('email_count:10'), countContext)).toEqual({
             field: 'email_count',
             operator: 'is',
             values: [10]
@@ -345,13 +372,13 @@ describe('numberCodec', () => {
 
 describe('dateCodec', () => {
     it('parses date comparison operators', () => {
-        expect(dateCodec().parse(nql.parse('created_at:<=\'2024-01-01T23:59:59.999Z\'') as never, dateContext)).toEqual({
+        expect(dateCodec().parse(ast('created_at:<=\'2024-01-01T23:59:59.999Z\''), dateContext)).toEqual({
             field: 'created_at',
             operator: 'is-or-less',
             values: ['2024-01-01']
         });
 
-        expect(dateCodec().parse(nql.parse('created_at:>\'2024-01-01T23:59:59.999Z\'') as never, dateContext)).toEqual({
+        expect(dateCodec().parse(ast('created_at:>\'2024-01-01T23:59:59.999Z\''), dateContext)).toEqual({
             field: 'created_at',
             operator: 'is-greater',
             values: ['2024-01-01']
@@ -371,7 +398,7 @@ describe('dateCodec', () => {
     });
 
     it('returns null for invalid date values', () => {
-        expect(dateCodec().parse(nql.parse('created_at:<=\'not-a-date\'') as never, dateContext)).toBeNull();
+        expect(dateCodec().parse(ast('created_at:<=\'not-a-date\''), dateContext)).toBeNull();
         expect(dateCodec().serialize({
             id: '1',
             field: 'created_at',

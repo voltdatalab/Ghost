@@ -2,7 +2,7 @@ import {DATE_FILTER_OPERATORS, DEFAULT_DATE_OPERATOR, type FilterCodec, dateCode
 
 const reportedCodec: FilterCodec = {
     parse(node, ctx) {
-        const comparator = extractComparator(node as Record<string, unknown>);
+        const comparator = extractComparator(node);
 
         if (!comparator || comparator.field !== 'count.reports') {
             return null;

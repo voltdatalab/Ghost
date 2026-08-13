@@ -1,4 +1,4 @@
-import {type AstNode, type FilterPredicate, type ParsedPredicate, dispatchSimpleNodes, getFieldKeysByType, hasFieldKey, parseFilterToAst, resolveField, serializePredicates, stampPredicates} from '@/shared/filters';
+import {type AstNode, type FilterPredicate, type ParsedPredicate, dispatchCompoundNode, dispatchSimpleNodes, getCompoundChildren, getFieldKeysByType, hasFieldKey, parseFilterToAst, readNegatedString, resolveField, serializePredicates, stampPredicates} from '@/shared/filters';
 import {memberFields} from './member-fields';
 import type {MemberFields} from './member-fields';
 
@@ -18,13 +18,13 @@ export function isPredicateEnabled(predicate: ParsedPredicate, fields: MemberFie
     return resolved?.definition.operators.includes(predicate.operator) ?? false;
 }
 
-function getCompoundChildren(node: AstNode): {operator: '$and' | '$or'; children: AstNode[]} | null {
-    if (Array.isArray(node.$and)) {
-        return {operator: '$and', children: node.$and as AstNode[]};
-    }
+function getCompound(node: AstNode): {operator: '$and' | '$or'; children: AstNode[]} | null {
+    for (const operator of ['$and', '$or'] as const) {
+        const children = getCompoundChildren(node, operator);
 
-    if (Array.isArray(node.$or)) {
-        return {operator: '$or', children: node.$or as AstNode[]};
+        if (children) {
+            return {operator, children};
+        }
     }
 
     return null;
@@ -57,7 +57,7 @@ function matchSubscribedNode(node: AstNode): ParsedPredicate | null {
         }
     }
 
-    const compound = getCompoundChildren(node);
+    const compound = getCompound(node);
 
     if (!compound || compound.children.length !== 2) {
         return null;
@@ -96,7 +96,7 @@ function matchSubscribedNode(node: AstNode): ParsedPredicate | null {
 }
 
 function matchNewsletterGroupedNode(node: AstNode): ParsedPredicate | null {
-    const compound = getCompoundChildren(node);
+    const compound = getCompound(node);
 
     if (!compound || compound.children.length !== 2) {
         return null;
@@ -112,14 +112,7 @@ function matchNewsletterGroupedNode(node: AstNode): ParsedPredicate | null {
             slug = newsletterSlug;
         }
 
-        if (
-            newsletterSlug &&
-            typeof newsletterSlug === 'object' &&
-            !Array.isArray(newsletterSlug) &&
-            typeof (newsletterSlug as Record<string, unknown>).$ne === 'string'
-        ) {
-            slug = (newsletterSlug as Record<string, string>).$ne;
-        }
+        slug = readNegatedString(newsletterSlug) ?? slug;
 
         if (typeof child.email_disabled === 'number') {
             emailDisabledValue = child.email_disabled;
@@ -150,7 +143,7 @@ function matchNewsletterGroupedNode(node: AstNode): ParsedPredicate | null {
 }
 
 function matchFeedbackGroupedNode(node: AstNode): ParsedPredicate | null {
-    const compound = getCompoundChildren(node);
+    const compound = getCompound(node);
 
     if (!compound || compound.operator !== '$and' || compound.children.length !== 2) {
         return null;
@@ -180,164 +173,14 @@ function matchFeedbackGroupedNode(node: AstNode): ParsedPredicate | null {
     };
 }
 
-// A trailing `$` is an end anchor only when it isn't escaped: a value containing
-// a literal `$` (contains `5$`) reaches here as the source `5\$`, which must not
-// be read as ends-with. An odd run of backslashes before the `$` escapes it.
-function endsWithAnchor(source: string): boolean {
-    if (!source.endsWith('$')) {
-        return false;
-    }
-    let backslashes = 0;
-    for (let i = source.length - 2; i >= 0 && source[i] === '\\'; i -= 1) {
-        backslashes += 1;
-    }
-    return backslashes % 2 === 0;
-}
-
-// A regex value read back into a text operator by its anchors, mirroring the
-// serialize symbols in member-fields.ts (`~` contains, `~^` starts, `~$` ends).
-// A literal `^` in a value is escaped to `\^` so it never leads, but a literal
-// `$` escapes to `\$` and still ends the source, hence the anchor check above.
-// `$not` is only ever emitted by `does-not-contain` (an unanchored regex), so a
-// negated pattern always maps back to that operator.
-function regexToOperator(pattern: RegExp, negated: boolean): {operator: string; value: string} {
-    const source = pattern.source;
-    const startsWith = source.startsWith('^');
-    const endsWith = endsWithAnchor(source);
-
-    let base: string;
-    let body: string;
-    if (startsWith && !endsWith) {
-        base = 'starts-with';
-        body = source.slice(1);
-    } else if (endsWith && !startsWith) {
-        base = 'ends-with';
-        body = source.slice(0, -1);
-    } else {
-        base = 'contains';
-        body = source;
-    }
-
-    const value = body.replace(/\\([\\.^$|?*+()[\]{}/-])/g, '$1');
-    return {operator: negated ? 'does-not-contain' : base, value};
-}
-
-// The value NQL a custom-field predicate carries, read back into a (operator,
-// value) pair. nql represents `:~x` as {$regex: /x/} and its negation as
-// {$not: /x/}; a bare string is `is` and {$ne} is `is-not`. Returns null for a
-// shape we don't emit.
-function interpretCustomFieldValue(raw: unknown): {operator: string; value: string} | null {
-    if (typeof raw === 'string') {
-        return {operator: 'is', value: raw};
-    }
-
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-        const object = raw as Record<string, unknown>;
-
-        if (typeof object.$ne === 'string') {
-            return {operator: 'is-not', value: object.$ne};
-        }
-
-        if (object.$regex instanceof RegExp) {
-            return regexToOperator(object.$regex, false);
-        }
-
-        if (object.$not instanceof RegExp) {
-            return regexToOperator(object.$not, true);
-        }
-    }
-
-    return null;
-}
-
-// A custom-field filter is `(custom_fields.key:'<key>'+custom_fields.value[.sub]:<v>)`,
-// or the flat `custom_fields.key:'<key>'` / `:-'<key>'` for set / not set. Each field
-// is its own predicate keyed `custom_field.<key>`, so the field's stable key becomes
-// part of the predicate field and the remaining `values` are [subfield, value]
-// (subfield '' for a scalar field or the whole-field set/unset case). This can't ride
-// the generic parser because the key lives in the value of the key clause, not the key.
-function matchCustomFieldNode(node: AstNode): ParsedPredicate | null {
-    const compound = getCompoundChildren(node);
-
-    if (!compound) {
-        const keyValue = node['custom_fields.key'];
-
-        if (typeof keyValue === 'string') {
-            return {field: `custom_field.${keyValue}`, operator: 'is-set', values: ['', '']};
-        }
-
-        if (keyValue && typeof keyValue === 'object' && !Array.isArray(keyValue) && typeof (keyValue as Record<string, unknown>).$ne === 'string') {
-            return {field: `custom_field.${(keyValue as Record<string, string>).$ne}`, operator: 'is-not-set', values: ['', '']};
-        }
-
-        return null;
-    }
-
-    if (compound.operator !== '$and' || compound.children.length !== 2) {
-        return null;
-    }
-
-    let fieldKey: string | undefined;
-    let valueEntry: {subfield: string; raw: unknown} | undefined;
-    let pathEntry: {subfield: string; negated: boolean} | undefined;
-
-    for (const child of compound.children) {
-        if (typeof child['custom_fields.key'] === 'string') {
-            fieldKey = child['custom_fields.key'];
-        }
-
-        for (const childKey of Object.keys(child)) {
-            if (childKey === 'custom_fields.value') {
-                valueEntry = {subfield: '', raw: child[childKey]};
-            } else if (childKey.startsWith('custom_fields.value.')) {
-                valueEntry = {subfield: childKey.slice('custom_fields.value.'.length), raw: child[childKey]};
-            } else if (childKey === 'custom_fields.path') {
-                const raw = child[childKey];
-
-                if (typeof raw === 'string') {
-                    pathEntry = {subfield: raw, negated: false};
-                } else if (raw && typeof raw === 'object' && !Array.isArray(raw) && typeof (raw as Record<string, unknown>).$ne === 'string') {
-                    pathEntry = {subfield: (raw as Record<string, string>).$ne, negated: true};
-                }
-            }
-        }
-    }
-
-    if (!fieldKey) {
-        return null;
-    }
-
-    // A `path` clause is a part's set / not-set: its presence, carrying no value.
-    if (pathEntry) {
-        return {
-            field: `custom_field.${fieldKey}`,
-            operator: pathEntry.negated ? 'is-not-set' : 'is-set',
-            values: [pathEntry.subfield, '']
-        };
-    }
-
-    if (!valueEntry) {
-        return null;
-    }
-
-    const interpreted = interpretCustomFieldValue(valueEntry.raw);
-
-    if (!interpreted) {
-        return null;
-    }
-
-    return {
-        field: `custom_field.${fieldKey}`,
-        operator: interpreted.operator,
-        values: [valueEntry.subfield, interpreted.value]
-    };
-}
-
+// Lifecycle encodings with no single field of their own: `subscribed` spans two columns,
+// a newsletter pairs a slug with email_disabled, and feedback pairs a post with a score.
+// Each is one predicate spread across a compound, so each needs a matcher here. A field
+// whose codec declares its own grammar is reached through the catalogue instead.
 const MEMBER_COMPOUND_MATCHERS: CompoundMatcher[] = [
     matchSubscribedNode,
     matchNewsletterGroupedNode,
-    matchFeedbackGroupedNode,
-    matchCustomFieldNode
+    matchFeedbackGroupedNode
 ];
 
 function parseMemberNode(node: AstNode, timezone: string): ParsedPredicate[] {
@@ -349,7 +192,13 @@ function parseMemberNode(node: AstNode, timezone: string): ParsedPredicate[] {
         }
     }
 
-    const compound = getCompoundChildren(node);
+    const addressed = dispatchCompoundNode(node, memberFields, timezone);
+
+    if (addressed) {
+        return [addressed];
+    }
+
+    const compound = getCompound(node);
 
     if (compound?.operator === '$and') {
         return compound.children.flatMap(child => parseMemberNode(child, timezone));
