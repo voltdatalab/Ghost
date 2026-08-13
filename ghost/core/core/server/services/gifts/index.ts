@@ -37,6 +37,7 @@ export async function init(options: GiftServiceInitOptions): Promise<void> {
     const SendGiftDeliveryEvent = require('./events/send-gift-delivery-event');
     const StartGiftCleanupEvent = require('./events/start-gift-cleanup-event');
     const jobs = require('./jobs');
+    const emailAnalyticsJobs = require('../email-analytics/jobs');
 
     const {GhostMailer} = require('../mail');
     const MailgunClient = require('../lib/mailgun-client');
@@ -91,6 +92,9 @@ export async function init(options: GiftServiceInitOptions): Promise<void> {
         },
         giftReminderScheduler,
         dispatchGiftDelivery,
+        giftEmailAnalytics: {
+            schedule: () => emailAnalyticsJobs.scheduleRecurringGiftDeliveriesJob(true)
+        },
         checkoutAdapter,
         labsService,
         settingsCache

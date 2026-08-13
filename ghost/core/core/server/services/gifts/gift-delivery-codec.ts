@@ -10,7 +10,10 @@ export const giftDeliveryCodec = z.codec(DbGiftDelivery, z.instanceof(GiftDelive
         status: row.status,
         startedAt: row.started_at,
         emailSentAt: row.email_sent_at,
-        emailProviderMessageId: row.email_provider_message_id
+        emailProviderMessageId: row.email_provider_message_id,
+        outcome: row.outcome,
+        outcomeAt: row.outcome_at,
+        outcomeError: row.outcome_error
     }),
     encode: delivery => ({
         id: delivery.id,
@@ -19,7 +22,10 @@ export const giftDeliveryCodec = z.codec(DbGiftDelivery, z.instanceof(GiftDelive
         status: delivery.status,
         started_at: delivery.startedAt,
         email_sent_at: delivery.emailSentAt,
-        email_provider_message_id: delivery.emailProviderMessageId
+        email_provider_message_id: delivery.emailProviderMessageId,
+        outcome: delivery.outcome,
+        outcome_at: delivery.outcomeAt,
+        outcome_error: delivery.outcomeError
     })
 });
 

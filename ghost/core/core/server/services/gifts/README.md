@@ -24,7 +24,14 @@ transactions, or Stripe objects.
   `processExpired()` own lifecycle work. Email delivery starts immediately after
   purchase through an in-process event. Delivery claims are atomic and each
   delivery makes one Mailgun acceptance attempt.
+- `recordDeliveryOutcome(...)` retains only the newest Mailgun delivery outcome;
+  mail transport acceptance remains the authoritative sent fact. A newly
+  recorded permanent provider failure sends the buyer a best-effort
+  transactional notification containing the gift link for manual sharing.
 - `reassignRedeemer(...)` is the import capability.
 
 The `Gift` and `GiftDelivery` models, their repositories, Bookshelf queries,
-Stripe checkout and email collaborators are internal adapters.
+Stripe checkout, email, and notification collaborators are internal
+adapters. Recipient delivery uses the bulk Mailgun account so delivery outcomes
+are observable; buyer-facing confirmations and failure notices use the
+provider-agnostic transactional mailer.

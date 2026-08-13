@@ -1,17 +1,19 @@
 import type {Knex} from 'knex';
 import {GiftDelivery} from './gift-delivery';
 import {decodeGiftDeliveryRow, encodeGiftDelivery} from './gift-delivery-codec';
-import type {GiftDeliveryRow} from './gift-delivery-schema';
+import type {GiftDeliveryOutcome, GiftDeliveryRow} from './gift-delivery-schema';
 import {toDatabaseDate, type RepositoryTransactionOptions} from './gift-bookshelf-repository';
 
 export interface GiftDeliveryRepository {
     getById(id: string, options?: RepositoryTransactionOptions): Promise<GiftDelivery | null>;
     getByGiftId(giftId: string, options?: RepositoryTransactionOptions): Promise<GiftDelivery | null>;
+    getByProviderMessageId(providerMessageId: string): Promise<GiftDelivery | null>;
     tryStartDelivery(id: string, now: Date): Promise<GiftDelivery | null>;
     markSent(id: string, sentAt: Date, providerMessageId: string | null): Promise<boolean>;
     markFailed(id: string): Promise<boolean>;
     markCancelled(id: string): Promise<boolean>;
     cancelPendingForGift(token: string, options?: RepositoryTransactionOptions): Promise<boolean>;
+    recordOutcome(data: {providerMessageId: string; outcome: GiftDeliveryOutcome; timestamp: Date; error: string | null}): Promise<boolean>;
     create(delivery: GiftDelivery, options?: RepositoryTransactionOptions): Promise<void>;
     transaction<T>(callback: (transacting: Knex.Transaction) => Promise<T>): Promise<T>;
 }
@@ -45,6 +47,12 @@ export class GiftDeliveryBookshelfRepository implements GiftDeliveryRepository {
 
     async getByGiftId(giftId: string, options: RepositoryTransactionOptions = {}): Promise<GiftDelivery | null> {
         const model = await this.model.findOne({gift_id: giftId}, {require: false, ...options});
+
+        return model ? decodeGiftDeliveryRow(model.toJSON()) : null;
+    }
+
+    async getByProviderMessageId(providerMessageId: string): Promise<GiftDelivery | null> {
+        const model = await this.model.findOne({email_provider_message_id: providerMessageId}, {require: false});
 
         return model ? decodeGiftDeliveryRow(model.toJSON()) : null;
     }
@@ -107,6 +115,24 @@ export class GiftDeliveryBookshelfRepository implements GiftDeliveryRepository {
         };
 
         return options.transacting ? update(options.transacting) : this.transaction(update);
+    }
+
+    async recordOutcome({providerMessageId, outcome, timestamp, error}: {providerMessageId: string; outcome: GiftDeliveryOutcome; timestamp: Date; error: string | null}): Promise<boolean> {
+        return this.transaction(async (transacting) => {
+            const outcomeAt = toDatabaseDate(timestamp);
+            const updated = await transacting('gift_deliveries')
+                .where({email_provider_message_id: providerMessageId})
+                .where((builder) => {
+                    builder.whereNull('outcome_at').orWhere('outcome_at', '<', outcomeAt);
+                })
+                .update({
+                    outcome,
+                    outcome_at: outcomeAt,
+                    outcome_error: error
+                });
+
+            return updated === 1;
+        });
     }
 
     async create(delivery: GiftDelivery, options: RepositoryTransactionOptions = {}): Promise<void> {

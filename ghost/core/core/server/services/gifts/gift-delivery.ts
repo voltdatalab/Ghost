@@ -2,6 +2,7 @@ import ObjectID from 'bson-objectid';
 import type {
     GiftDeliveryData,
     GiftDeliveryDataInput,
+    GiftDeliveryOutcome,
     GiftDeliveryStatus
 } from './gift-delivery-schema';
 
@@ -13,6 +14,9 @@ export class GiftDelivery implements GiftDeliveryData {
     startedAt: Date | null;
     emailSentAt: Date | null;
     emailProviderMessageId: string | null;
+    outcome: GiftDeliveryOutcome;
+    outcomeAt: Date | null;
+    outcomeError: string | null;
 
     constructor(data: GiftDeliveryDataInput) {
         this.id = data.id;
@@ -22,6 +26,9 @@ export class GiftDelivery implements GiftDeliveryData {
         this.startedAt = data.startedAt ?? null;
         this.emailSentAt = data.emailSentAt ?? null;
         this.emailProviderMessageId = data.emailProviderMessageId ?? null;
+        this.outcome = data.outcome ?? 'unknown';
+        this.outcomeAt = data.outcomeAt ?? null;
+        this.outcomeError = data.outcomeError ?? null;
     }
 
     static fromPurchase({giftId, recipientEmail}: {giftId: string; recipientEmail: string}) {
