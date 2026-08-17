@@ -132,6 +132,18 @@ class EmailController {
 
         return await this.service.retryEmail(email);
     }
+
+    async resumePartialEmail(frame) {
+        const email = await this.models.Email.findOne(frame.data, {require: false});
+
+        if (!email) {
+            throw new errors.NotFoundError({
+                message: tpl(messages.emailNotFound)
+            });
+        }
+
+        return await this.service.resumePartialEmail(email);
+    }
 }
 
 module.exports = EmailController;

@@ -996,6 +996,73 @@ describe('Batch Sending Service', function () {
             clock.restore();
         });
 
+        it('uses the persisted partial-resume transition timestamp for delivery deadlines', function () {
+            const now = new Date('2026-08-17T20:00:00.000Z');
+            const clock = sinon.useFakeTimers(now);
+            const targetDeliveryWindow = 300000; // 5 minutes
+            const partialTransitionAt = new Date(now.getTime() - 60000); // 1 minute ago
+            const originalCampaignCreatedAt = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+            const service = new BatchSendingService({
+                sendingService: {
+                    getTargetDeliveryWindow() {
+                        return targetDeliveryWindow;
+                    }
+                }
+            });
+            const partialEmail = createModel({
+                created_at: originalCampaignCreatedAt,
+                updated_at: partialTransitionAt,
+                partial_resume: true
+            });
+            const ordinaryEmail = createModel({
+                created_at: partialTransitionAt,
+                updated_at: now,
+                partial_resume: false
+            });
+
+            assert.equal(
+                service.getDeliveryDeadline(partialEmail).getTime(),
+                partialTransitionAt.getTime() + targetDeliveryWindow,
+                'a partial continuation must start its target window at its persisted status transition'
+            );
+            assert.equal(
+                service.getDeliveryDeadline(ordinaryEmail).getTime(),
+                partialTransitionAt.getTime() + targetDeliveryWindow,
+                'ordinary delivery must preserve the original created_at behavior'
+            );
+
+            clock.restore();
+        });
+
+        it('fails closed before dispatching a partial continuation without a valid persisted transition timestamp', async function () {
+            for (const updatedAt of [null, 'not-a-date']) {
+                const service = new BatchSendingService({
+                    sendingService: {
+                        getTargetDeliveryWindow() {
+                            return 0;
+                        }
+                    }
+                });
+                const sendBatch = sinon.stub(service, 'sendBatch').resolves(true);
+
+                await assert.rejects(
+                    service.sendBatches({
+                        email: createModel({
+                            id: `partial-with-${updatedAt === null ? 'missing' : 'invalid'}-transition`,
+                            created_at: new Date(),
+                            updated_at: updatedAt,
+                            partial_resume: true
+                        }),
+                        batches: [createModel({})],
+                        post: createModel({}),
+                        newsletter: createModel({})
+                    }),
+                    /partial continuation.*updated_at.*missing or invalid/i
+                );
+                sinon.assert.notCalled(sendBatch);
+            }
+        });
+
         it('respreads deliverytimes over a fresh window if the deadline is in the past', async function () {
             // When a send is resumed after the original deadline has passed (e.g. boot-time
             // recovery of an interrupted send, or a job system delay), we still want to

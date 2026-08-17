@@ -913,6 +913,10 @@ module.exports = {
             defaultTo: 'pending',
             validations: {isIn: [['pending', 'submitting', 'submitted', 'failed']]}
         },
+        // Set only by the explicit partial-resume operation. It survives a process
+        // restart so boot recovery returns to the anti-join continuation path instead
+        // of treating a partially-materialized email as a generic retry.
+        partial_resume: {type: 'boolean', nullable: false, defaultTo: false},
         recipient_filter: {
             type: 'text',
             maxlength: 1000000000,
@@ -959,6 +963,11 @@ module.exports = {
             validations: {isIn: [['pending', 'submitting', 'submitted', 'failed']]}
         },
         member_segment: {type: 'text', maxlength: 2000, nullable: true},
+        // Immutable recipient manifest recorded with the batch creation
+        // transaction. Null is deliberate for pre-manifest legacy batches,
+        // which cannot be proven safe for an automatic partial continuation.
+        recipient_count: {type: 'integer', nullable: true, unsigned: true},
+        recipient_hash: {type: 'string', maxlength: 64, nullable: true},
         error_status_code: {type: 'integer', nullable: true, unsigned: true},
         error_message: {type: 'string', maxlength: 2000, nullable: true},
         error_data: {type: 'text', maxlength: 1000000000, fieldtype: 'long', nullable: true},
@@ -982,6 +991,11 @@ module.exports = {
             ['email_id', 'delivered_at'],
             ['email_id', 'opened_at'],
             ['email_id', 'failed_at']
+        ],
+        // An email may be continued after an interrupted materialization. Keep the
+        // recipient ledger authoritative even if two workers ever race the service lock.
+        '@@UNIQUE_CONSTRAINTS@@': [
+            {columns: ['email_id', 'member_id'], indexName: 'email_recipients_email_member_unique'}
         ]
     },
     email_recipient_failures: {

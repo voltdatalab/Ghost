@@ -26,7 +26,10 @@ const messages = {
     missingNewsletterError: 'The post does not have a newsletter relation',
     emailSendingDisabled: `Email sending is temporarily disabled because your account is currently in review. You should have an email about this from us already, but you can also reach us any time at support@ghost.org`,
     retryEmailStatusError: 'Can only retry emails for published posts',
-    retryEmailNotFailed: 'Only failed emails can be retried'
+    retryEmailNotFailed: 'Only failed emails can be retried',
+    retryPartialResume: 'Emails left by a partial continuation cannot use the generic retry path',
+    partialResumeNotSubmitted: 'Only submitted emails can start a partial continuation',
+    partialResumeAlreadyStarted: 'This email was changed before its partial continuation could start'
 };
 
 // Resume scanner won't pick up `submitting` rows older than this. Rows beyond the cutoff
@@ -48,6 +51,7 @@ class EmailService {
     #emailAnalyticsJobs;
     #domainWarmingService;
     #config;
+    #resumeScannerServiceStartMs;
 
     /**
      *
@@ -66,6 +70,8 @@ class EmailService {
      * @param {object} dependencies.emailAnalyticsJobs
      * @param {DomainWarmingService} dependencies.domainWarmingService
      * @param {object} [dependencies.config] - Config service for reading host settings
+     * @param {Date|number} [dependencies.resumeScannerServiceStart] - Immutable
+     * upper bound for rows eligible to be recovered by this service instance
      */
     constructor({
         batchSendingService,
@@ -79,7 +85,8 @@ class EmailService {
         verificationTrigger,
         emailAnalyticsJobs,
         domainWarmingService,
-        config
+        config,
+        resumeScannerServiceStart = Date.now()
     }) {
         this.#batchSendingService = batchSendingService;
         this.#models = models;
@@ -93,6 +100,7 @@ class EmailService {
         this.#emailAnalyticsJobs = emailAnalyticsJobs;
         this.#domainWarmingService = domainWarmingService;
         this.#config = config;
+        this.#resumeScannerServiceStartMs = new Date(resumeScannerServiceStart).getTime();
     }
 
     /**
@@ -221,14 +229,15 @@ class EmailService {
      */
     async resumeInterruptedSends() {
         const maxAgeMs = this.#config?.get?.('bulkEmail:resumeMaxAgeMs') ?? DEFAULT_RESUME_MAX_AGE_MS;
-        const cutoffIso = new Date(Date.now() - maxAgeMs).toISOString();
+        const cutoffMs = Date.now() - maxAgeMs;
+        const cutoffIso = new Date(cutoffMs).toISOString();
 
         // Stale rows: too old to safely resume. Flip to `failed` so they surface in admin UI
         // for operator review instead of being silently left in `submitting` forever.
         const stale = await this.#models.Email.findAll({
             filter: `status:submitting+created_at:<'${cutoffIso}'`
         });
-        const staleList = stale.models || stale;
+        const staleList = (stale.models || stale).filter(email => email.get('partial_resume') !== true);
         for (const email of staleList) {
             try {
                 const locked = await this.#batchSendingService.updateStatusLock(
@@ -245,27 +254,102 @@ class EmailService {
             }
         }
 
-        // Fresh rows: within the cutoff. Resume through the normal emailJob path.
-        const emails = await this.#models.Email.findAll({
-            filter: `status:submitting+created_at:>'${cutoffIso}'`
+        // The explicit partial-resume endpoint changes the status of an existing,
+        // potentially old email, then schedules an in-process job. Its recovery
+        // age must be measured from that transition (`updated_at`), not from the
+        // original campaign creation time. NQL cannot reliably compare updated_at
+        // on every supported database, so query this deliberately small explicit
+        // continuation set then classify its persisted timestamp locally. An absent
+        // or invalid timestamp is ambiguous and is therefore stale/fail-closed.
+        const partialContinuations = await this.#models.Email.findAll({
+            filter: 'status:[pending,submitting]+partial_resume:true'
         });
-        const list = emails.models || emails;
-        if (staleList.length === 0 && list.length === 0) {
-            return;
-        }
-        if (list.length > 0) {
-            logging.info(`Email resume: found ${list.length} email(s) in submitting status within max age (${maxAgeMs}ms)`);
-        }
-
-        for (const email of list) {
+        const partialContinuationList = partialContinuations.models || partialContinuations;
+        const partialTransitionTime = email => new Date(email.get('updated_at')).getTime();
+        const stalePartialList = partialContinuationList.filter((email) => {
+            const updatedAtMs = partialTransitionTime(email);
+            return !Number.isFinite(updatedAtMs) ||
+                (updatedAtMs <= this.#resumeScannerServiceStartMs && updatedAtMs < cutoffMs);
+        });
+        const freshPartialList = partialContinuationList.filter((email) => {
+            const updatedAtMs = partialTransitionTime(email);
+            return Number.isFinite(updatedAtMs) &&
+                updatedAtMs <= this.#resumeScannerServiceStartMs &&
+                updatedAtMs >= cutoffMs;
+        });
+        for (const email of stalePartialList) {
             try {
-                await this.#resumeOneEmail(email);
+                const locked = await this.#batchSendingService.updateStatusLock(
+                    this.#models.Email,
+                    email.id,
+                    'failed',
+                    ['pending', 'submitting']
+                );
+                if (locked) {
+                    logging.warn(`Email partial resume: ${email.id} state transition exceeds max age (${maxAgeMs}ms) — flipped to failed for operator review`);
+                }
             } catch (e) {
                 logging.error(e);
             }
         }
 
-        logging.info(`Email resume scan complete: ${staleList.length} stale email(s) flipped to failed, ${list.length} fresh email(s) rescheduled`);
+        // Fresh rows: within the cutoff. Resume through the normal emailJob path.
+        const emails = await this.#models.Email.findAll({
+            filter: `status:submitting+created_at:>'${cutoffIso}'`
+        });
+        const list = (emails.models || emails).filter(email => email.get('partial_resume') !== true);
+        const submittingPartialList = freshPartialList.filter(email => email.get('status') === 'submitting');
+        const pendingPartialList = freshPartialList.filter(email => email.get('status') === 'pending');
+        if (staleList.length === 0 && stalePartialList.length === 0 && list.length === 0 && freshPartialList.length === 0) {
+            return;
+        }
+        if (list.length > 0) {
+            logging.info(`Email resume: found ${list.length} email(s) in submitting status within max age (${maxAgeMs}ms)`);
+        }
+        if (freshPartialList.length > 0) {
+            logging.info(`Email partial resume: found ${submittingPartialList.length} submitting and ${pendingPartialList.length} pending continuation(s) within max age (${maxAgeMs}ms)`);
+        }
+
+        // A fresh `submitting` partial continuation is atomically moved to
+        // `pending` by #resumeOneEmail. Record scheduled IDs defensively in case
+        // an overlapping snapshot reaches a second scanner path; emailJob's own
+        // CAS remains the cross-process deduplication authority.
+        const scheduledIds = new Set();
+        for (const email of list) {
+            try {
+                if (await this.#resumeOneEmail(email)) {
+                    scheduledIds.add(email.id);
+                }
+            } catch (e) {
+                logging.error(e);
+            }
+        }
+        for (const email of submittingPartialList) {
+            if (scheduledIds.has(email.id)) {
+                continue;
+            }
+            try {
+                if (await this.#resumeOneEmail(email)) {
+                    scheduledIds.add(email.id);
+                }
+            } catch (e) {
+                logging.error(e);
+            }
+        }
+        for (const email of pendingPartialList) {
+            if (scheduledIds.has(email.id)) {
+                continue;
+            }
+            try {
+                if (await this.#resumePendingPartialEmail(email)) {
+                    scheduledIds.add(email.id);
+                }
+            } catch (e) {
+                logging.error(e);
+            }
+        }
+
+        logging.info(`Email resume scan complete: ${staleList.length} stale submitting email(s) and ${stalePartialList.length} stale partial continuation(s) flipped to failed; ${scheduledIds.size} fresh email(s) rescheduled`);
     }
 
     async #resumeOneEmail(email) {
@@ -285,7 +369,7 @@ class EmailService {
             if (locked) {
                 logging.warn(`Email resume: ${email.id} parent post status=${postStatus} is not sendable — marked email as failed`);
             }
-            return;
+            return false;
         }
 
         // Flip submitting -> pending so emailJob's status lock (['pending', 'failed']) admits it.
@@ -298,7 +382,7 @@ class EmailService {
         );
         if (!locked) {
             logging.info(`Email resume: ${email.id} status changed before lock could be taken — skipping`);
-            return;
+            return false;
         }
 
         // Structured breadcrumb so post-incident timing/batch state is recoverable from logs.
@@ -307,6 +391,53 @@ class EmailService {
 
         // Skip checkLimits — this email already passed limits when first sent.
         this.#batchSendingService.scheduleEmail(email);
+        return true;
+    }
+
+    /**
+     * Recovers the small handoff window after the explicit endpoint persisted a
+     * partial continuation but before its in-memory job had a chance to claim it.
+     * The downstream emailJob compare-and-set lock handles an overlapping process.
+     *
+     * @param {Email} email
+     * @returns {Promise<boolean>}
+     */
+    async #resumePendingPartialEmail(email) {
+        const post = await email.getLazyRelation('post');
+        const postStatus = post ? post.get('status') : null;
+        const sendable = postStatus === 'published' || postStatus === 'sent';
+
+        if (!sendable) {
+            const locked = await this.#batchSendingService.updateStatusLock(
+                this.#models.Email,
+                email.id,
+                'failed',
+                ['pending']
+            );
+            if (locked) {
+                logging.warn(`Email partial resume: ${email.id} parent post status=${postStatus} is not sendable — marked email as failed`);
+            }
+            return false;
+        }
+
+        // Claim the handoff window before enqueueing. A second boot scanner can
+        // then neither enqueue this row nor re-send it; if this process exits
+        // after the claim, the durable `submitting` partial state is recovered by
+        // #resumeOneEmail on the following boot.
+        const locked = await this.#batchSendingService.updateStatusLock(
+            this.#models.Email,
+            email.id,
+            'submitting',
+            ['pending']
+        );
+        if (!locked) {
+            logging.info(`Email partial resume: ${email.id} was claimed before the pending handoff lock could be taken — skipping`);
+            return false;
+        }
+
+        logging.warn(`Email partial resume: scheduling claimed pending continuation ${email.id}`);
+        this.#batchSendingService.scheduleEmail(locked, {partialResumeClaimed: true});
+        return true;
     }
 
     async #buildResumeBreadcrumb(email) {
@@ -344,6 +475,12 @@ class EmailService {
     }
 
     async retryEmail(email) {
+        if (email.get('partial_resume') === true) {
+            throw new errors.BadRequestError({
+                message: tpl(messages.retryPartialResume)
+            });
+        }
+
         // Block accidentaly retrying non-published posts (can happen due to bugs in frontend)
         const post = await email.getLazyRelation('post');
         if (post.get('status') !== 'published' && post.get('status') !== 'sent') {
@@ -366,6 +503,55 @@ class EmailService {
 
         this.#batchSendingService.scheduleEmail(email);
         return email;
+    }
+
+    /**
+     * Starts an explicit continuation for an email whose first materialization
+     * was interrupted after a provider-confirmed prefix. It can also deliberately
+     * re-open a failed partial continuation only after re-validating the same
+     * ledger. This bypasses neither the email-level compare-and-set lock nor the
+     * batch-level safety checks, and never falls through to generic retry.
+     *
+     * @param {Email} email
+     * @returns {Promise<Email>}
+     */
+    async resumePartialEmail(email) {
+        const status = email.get('status');
+        const isInitialPartialContinuation = status === 'submitted';
+        const isSafeFailedContinuation = status === 'failed' && email.get('partial_resume') === true;
+
+        if (!isInitialPartialContinuation && !isSafeFailedContinuation) {
+            throw new errors.BadRequestError({
+                message: tpl(messages.partialResumeNotSubmitted)
+            });
+        }
+
+        // Preflight is read-only and rejects complete or ambiguous emails before
+        // changing the state. The job repeats its critical checks after the CAS
+        // lock because recipient eligibility can legitimately change in between.
+        await this.#batchSendingService.assertCanStartPartialResume(email);
+
+        const locked = await this.#batchSendingService.updateStatusLock(
+            this.#models.Email,
+            email.id,
+            'pending',
+            isSafeFailedContinuation ? ['failed'] : ['submitted'],
+            {
+                partial_resume: true,
+                error: null
+            }
+        );
+        if (!locked) {
+            throw new errors.BadRequestError({
+                message: tpl(messages.partialResumeAlreadyStarted)
+            });
+        }
+
+        // Existing emails passed their original account limits. This is a
+        // continuation, not a new broadcast, so it intentionally skips
+        // checkLimits just as interrupted-send recovery does.
+        this.#batchSendingService.scheduleEmail(locked);
+        return locked;
     }
 
     /**

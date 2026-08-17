@@ -1,5 +1,6 @@
 const logging = require('@tryghost/logging');
 const ObjectID = require('bson-objectid').default;
+const crypto = require('node:crypto');
 const errors = require('@tryghost/errors');
 const tpl = require('@tryghost/tpl');
 const messages = {
@@ -137,34 +138,45 @@ class BatchSendingService {
      * @param {Email} email
      * @returns {void}
      */
-    scheduleEmail(email) {
+    scheduleEmail(email, {partialResumeClaimed = false} = {}) {
         return this.#jobsService.addJob({
             name: 'batch-sending-service-job',
             job: this.emailJob.bind(this),
-            data: {emailId: email.id},
+            data: {emailId: email.id, partialResumeClaimed},
             offloaded: false
         });
     }
 
     /**
      * @private
-     * @param {{emailId: string}} data Data passed from the job service. We only need the emailId because we need to refetch the email anyway to make sure the status is right and 'locked'.
+     * @param {{emailId: string, partialResumeClaimed?: boolean}} data Data passed from the job service. We only need the emailId because we need to refetch the email anyway to make sure the status is right and 'locked'.
      */
-    async emailJob({emailId}) {
+    async emailJob({emailId, partialResumeClaimed = false}) {
         logging.info(`Starting email job for email ${emailId}`);
 
         const startTime = Date.now();
 
-        // Check if email is 'pending' only + change status to submitting in one transaction.
-        // This allows us to have a lock around the email job that makes sure an email can only have one active job.
+        // Change pending/failed email to submitting in one transaction. A boot scanner
+        // may have already claimed a partial continuation with pending -> submitting;
+        // that job can only proceed if it can re-lock the durable claimed state.
         let email = await this.retryDb(
             async () => {
-                return await this.updateStatusLock(this.#models.Email, emailId, 'submitting', ['pending', 'failed']);
+                return await this.updateStatusLock(
+                    this.#models.Email,
+                    emailId,
+                    'submitting',
+                    partialResumeClaimed ? ['submitting'] : ['pending', 'failed']
+                );
             },
-            {...this.#BEFORE_RETRY_CONFIG, description: `updateStatusLock email ${emailId} -> submitting`}
+            {...this.#BEFORE_RETRY_CONFIG, description: `updateStatusLock email ${emailId} ${partialResumeClaimed ? '(partial already claimed)' : '-> submitting'}`}
         );
         if (!email) {
-            logging.error(`Tried sending email that is not pending or failed ${emailId}`);
+            const expectedState = partialResumeClaimed ? 'was not in the expected claimed state' : 'is not pending or failed';
+            logging.error(`Tried sending email that ${expectedState} ${emailId}`);
+            return;
+        }
+        if (partialResumeClaimed && email.get('partial_resume') !== true) {
+            logging.error(`Tried running an already-claimed partial continuation for a non-partial email ${emailId}`);
             return;
         }
 
@@ -177,13 +189,20 @@ class BatchSendingService {
         // Save a strict cutoff time for retries
         email._retryCutOffTime = retryCutOffTime;
 
+        const isPartialResume = email.get('partial_resume') === true;
+
         try {
-            await this.sendEmail(email);
+            if (isPartialResume) {
+                await this.sendPartialEmail(email);
+            } else {
+                await this.sendEmail(email);
+            }
             await this.retryDb(async () => {
                 await email.save({
                     status: 'submitted',
                     submitted_at: new Date(),
-                    error: null
+                    error: null,
+                    partial_resume: false
                 }, {patch: true, autoRefresh: false});
             }, {...this.#AFTER_RETRY_CONFIG, description: `email ${emailId} -> submitted`});
         } catch (e) {
@@ -221,7 +240,98 @@ class BatchSendingService {
     async sendEmail(email) {
         logging.info(`Sending email ${email.id}`);
 
-        // Load required relations
+        const {newsletter, post} = await this.#getEmailRelations(email);
+
+        let batches = await this.retryDb(async () => {
+            return await this.getBatches(email);
+        }, {...this.#getBeforeRetryConfig(email), description: `getBatches for email ${email.id}`});
+
+        if (batches.length === 0) {
+            batches = await this.createBatches({email, newsletter, post});
+        }
+        await this.sendBatches({email, batches, post, newsletter});
+    }
+
+    /**
+     * Returns only after the current state is a safe candidate for an explicit
+     * partial continuation. This is deliberately separate from retryEmail: a
+     * partial continuation may start only from an already-submitted email.
+     *
+     * @param {Email} email
+     * @returns {Promise<{missingRecipientCount: number}>}
+     */
+    async assertCanStartPartialResume(email) {
+        const {newsletter, post} = await this.#getEmailRelations(email);
+        this.#assertPartialResumeRelationsAreSafe(email, newsletter, post);
+        const batches = await this.getBatches(email);
+        await this.#assertPartialResumeBatchesAreSafe(email, batches);
+
+        const missingRecipientCount = await this.getMissingRecipientCount({email, newsletter, post});
+        if (missingRecipientCount === 0) {
+            throw new errors.BadRequestError({
+                message: `Email ${email.id} has no eligible recipients left to resume`
+            });
+        }
+
+        return {missingRecipientCount};
+    }
+
+    /**
+     * Continues an explicitly-marked partial email. The marker is persisted on
+     * the email before this job runs, so a clean shutdown can return through this
+     * same anti-join path on the next boot.
+     *
+     * @param {Email} email
+     */
+    async sendPartialEmail(email) {
+        logging.info(`Continuing partial email ${email.id}`);
+
+        const {newsletter, post} = await this.#getEmailRelations(email);
+        this.#assertPartialResumeRelationsAreSafe(email, newsletter, post);
+        const existingBatches = await this.retryDb(async () => {
+            return await this.getBatches(email);
+        }, {...this.#getBeforeRetryConfig(email), description: `get existing batches for partial email ${email.id}`});
+        await this.#assertPartialResumeBatchesAreSafe(email, existingBatches);
+
+        const existingRecipientCount = await this.retryDb(async () => {
+            return await this.getRecipientCount(email);
+        }, {...this.#getBeforeRetryConfig(email), description: `get existing recipient count for partial email ${email.id}`});
+
+        // This query is an anti-join against the persistent recipient ledger. It
+        // creates only rows that are absent from this email, never an entire
+        // audience replacement.
+        await this.createBatches({
+            email,
+            newsletter,
+            post,
+            excludeExistingRecipients: true,
+            existingRecipientCount
+        });
+
+        const currentBatches = await this.retryDb(async () => {
+            return await this.getBatches(email);
+        }, {...this.#getBeforeRetryConfig(email), description: `get continuation batches for partial email ${email.id}`});
+
+        // `pending` + no provider id is the only state that is unambiguously safe
+        // to send. Submitted batches remain part of the ledger but are never put
+        // back into the send queue; ambiguous and failed states were rejected above.
+        const batchesToSend = currentBatches.filter((batch) => {
+            return batch.get('status') === 'pending' && !batch.get('provider_id');
+        });
+        if (batchesToSend.length === 0) {
+            logging.info(`Partial email ${email.id} has no safely unsent batches after materialization`);
+            return;
+        }
+
+        await this.sendBatches({email, batches: batchesToSend, post, newsletter});
+    }
+
+    /**
+     * @private
+     * @param {Email} email
+     * @returns {Promise<{newsletter: Newsletter, post: Post}>}
+     */
+    async #getEmailRelations(email) {
         const newsletter = await this.retryDb(async () => {
             return await email.getLazyRelation('newsletter', {require: true});
         }, {...this.#getBeforeRetryConfig(email), description: `getLazyRelation newsletter for email ${email.id}`});
@@ -232,14 +342,194 @@ class BatchSendingService {
             return await email.getLazyRelation('post', {require: true, withRelated: postRelations});
         }, {...this.#getBeforeRetryConfig(email), description: `getLazyRelation post for email ${email.id}`});
 
-        let batches = await this.retryDb(async () => {
-            return await this.getBatches(email);
-        }, {...this.#getBeforeRetryConfig(email), description: `getBatches for email ${email.id}`});
+        return {newsletter, post};
+    }
 
-        if (batches.length === 0) {
-            batches = await this.createBatches({email, newsletter, post});
+    /**
+     * @private
+     * @param {Email} email
+     * @param {Newsletter} newsletter
+     * @param {Post} post
+     */
+    #assertPartialResumeRelationsAreSafe(email, newsletter, post) {
+        const postStatus = post.get('status');
+        if (postStatus !== 'published' && postStatus !== 'sent') {
+            throw new errors.BadRequestError({
+                message: `Email ${email.id} belongs to a post with non-sendable status=${postStatus}`
+            });
         }
-        await this.sendBatches({email, batches, post, newsletter});
+        if (newsletter.get('status') !== 'active') {
+            throw new errors.BadRequestError({
+                message: `Email ${email.id} belongs to an inactive newsletter`
+            });
+        }
+    }
+
+    /**
+     * Fails closed if a batch could have reached the provider without a durable
+     * submitted status, or if the original email has no confirmed prefix.
+     *
+     * @private
+     * @param {Email} email
+     * @param {EmailBatch[]} batches
+     */
+    async #assertPartialResumeBatchesAreSafe(email, batches) {
+        const confirmedBatches = batches.filter(batch => batch.get('status') === 'submitted' && batch.get('provider_id'));
+        if (confirmedBatches.length === 0) {
+            throw new errors.BadRequestError({
+                message: `Email ${email.id} has no provider-confirmed batches to continue`
+            });
+        }
+
+        const unsafeBatch = batches.find((batch) => {
+            const status = batch.get('status');
+            const providerId = batch.get('provider_id');
+            return (status === 'submitted' && !providerId) ||
+                (status === 'pending' && providerId) ||
+                !['submitted', 'pending'].includes(status);
+        });
+        if (unsafeBatch) {
+            throw new errors.BadRequestError({
+                message: `Email ${email.id} has batch ${unsafeBatch.id} in unsafe status=${unsafeBatch.get('status')}; reconcile provider state before continuing`
+            });
+        }
+
+        await this.#assertConfirmedBatchRecipientLedgersAreIntact(email, batches, confirmedBatches);
+    }
+
+    /**
+     * Proves that the durable recipient ledger for every batch already accepted
+     * by the provider still matches the manifest captured before that batch was
+     * sent. Without this check, a deleted prefix row is indistinguishable from
+     * an unmaterialized tail to an anti-join and could be sent twice.
+     *
+     * Legacy batches with null manifests are deliberately rejected: reconstructing
+     * their expected recipients from current member state would not prove what
+     * the provider accepted at the time of the original send.
+     *
+     * @private
+     * @param {Email} email
+     * @param {EmailBatch[]} batches
+     * @param {EmailBatch[]} confirmedBatches
+     */
+    async #assertConfirmedBatchRecipientLedgersAreIntact(email, batches, confirmedBatches) {
+        const recipientIdsByBatch = new Map(batches.map(batch => [batch.id, []]));
+        const recipients = await this.#db.knex('email_recipients')
+            .select('batch_id', 'member_id')
+            .where('email_id', email.id);
+
+        for (const recipient of recipients) {
+            const recipientIds = recipientIdsByBatch.get(recipient.batch_id);
+            if (!recipientIds || typeof recipient.member_id !== 'string' || recipient.member_id.length === 0) {
+                throw new errors.BadRequestError({
+                    message: `Email ${email.id} has an unverifiable recipient ledger; reconcile it before continuing`
+                });
+            }
+            recipientIds.push(recipient.member_id);
+        }
+
+        for (const batch of confirmedBatches) {
+            const expectedCount = Number(batch.get('recipient_count'));
+            const expectedHash = batch.get('recipient_hash');
+            const recipientIds = recipientIdsByBatch.get(batch.id);
+            if (!recipientIds) {
+                throw new errors.BadRequestError({
+                    message: `Email ${email.id} has an unverifiable provider-confirmed recipient ledger for batch ${batch.id}; reconcile it before continuing`
+                });
+            }
+            const actualManifest = this.#createRecipientManifest(recipientIds);
+
+            if (!Number.isSafeInteger(expectedCount) || expectedCount <= 0 ||
+                typeof expectedHash !== 'string' || !/^[a-f0-9]{64}$/.test(expectedHash) ||
+                actualManifest.recipientCount !== expectedCount ||
+                actualManifest.recipientHash !== expectedHash) {
+                throw new errors.BadRequestError({
+                    message: `Email ${email.id} has an unverifiable provider-confirmed recipient ledger for batch ${batch.id}; reconcile it before continuing`
+                });
+            }
+        }
+    }
+
+    /**
+     * @private
+     * @param {string[]} memberIds
+     * @returns {{recipientCount: number, recipientHash: string}}
+     */
+    #createRecipientManifest(memberIds) {
+        const canonicalMemberIds = [...memberIds].sort();
+        return {
+            recipientCount: canonicalMemberIds.length,
+            recipientHash: crypto.createHash('sha256').update(JSON.stringify(canonicalMemberIds)).digest('hex')
+        };
+    }
+
+    /**
+     * Counts the current eligible audience that has no recipient row for this
+     * email. It is used by the explicit entrypoint only; the job re-runs the
+     * anti-join itself to tolerate legitimate opt-outs before dispatch.
+     *
+     * @param {{email: Email, newsletter: Newsletter, post: Post}} data
+     * @returns {Promise<number>}
+     */
+    async getMissingRecipientCount({email, newsletter, post}) {
+        const segments = await this.#emailRenderer.getSegments(post);
+        let total = 0;
+
+        for (const segment of segments) {
+            const segmentFilter = this.#emailSegmenter.getMemberFilterForSegment(newsletter, email.get('recipient_filter'), segment);
+            const query = this.#getMembersQuery({
+                filter: segmentFilter + `+id:<'${email.id}'`,
+                emailId: email.id,
+                excludeExistingRecipients: true
+            });
+            const row = await query.clearSelect().countDistinct({count: 'members.id'}).first();
+            const count = Number(row?.count ?? 0);
+            if (!Number.isSafeInteger(count) || count < 0) {
+                throw new errors.InternalServerError({
+                    message: `Could not count missing recipients for email ${email.id}`
+                });
+            }
+            total += count;
+        }
+
+        return total;
+    }
+
+    /**
+     * @private
+     * @param {Email} email
+     * @returns {Promise<number>}
+     */
+    async getRecipientCount(email) {
+        const row = await this.#db.knex('email_recipients')
+            .where('email_id', email.id)
+            .count({count: 'id'})
+            .first();
+        const count = Number(row?.count ?? 0);
+        if (!Number.isSafeInteger(count) || count < 0) {
+            throw new errors.InternalServerError({
+                message: `Could not count persisted recipients for email ${email.id}`
+            });
+        }
+        return count;
+    }
+
+    /**
+     * @private
+     * @param {{filter: string, emailId: string, excludeExistingRecipients: boolean}} data
+     */
+    #getMembersQuery({filter, emailId, excludeExistingRecipients}) {
+        const query = this.#models.Member.getFilteredCollectionQuery({filter});
+        if (excludeExistingRecipients) {
+            query.whereNotExists((recipientsQuery) => {
+                recipientsQuery
+                    .select(this.#db.knex.raw('1'))
+                    .from('email_recipients')
+                    .where('email_recipients.email_id', emailId)
+                    .whereRaw('email_recipients.member_id = members.id');
+            });
+        }
+        return query;
     }
 
     /**
@@ -257,10 +547,10 @@ class BatchSendingService {
 
     /**
      * @private
-     * @param {{email: Email, newsletter: Newsletter, post: Post}} data
+     * @param {{email: Email, newsletter: Newsletter, post: Post, excludeExistingRecipients?: boolean, existingRecipientCount?: number}} data
      * @returns {Promise<EmailBatch[]>}
      */
-    async createBatches({email, post, newsletter}) {
+    async createBatches({email, post, newsletter, excludeExistingRecipients = false, existingRecipientCount = 0}) {
         logging.info(`Creating batches for email ${email.id}`);
 
         // Infinity implies all emails should be sent from the primary domain
@@ -272,7 +562,8 @@ class BatchSendingService {
         const segments = await this.#emailRenderer.getSegments(post);
         const batches = [];
         const BATCH_SIZE = this.#sendingService.getMaximumRecipients();
-        let totalCount = 0;
+        let totalCount = existingRecipientCount;
+        const initialRecipientCount = totalCount;
 
         for (const segment of segments) {
             logging.info(`Creating batches for email ${email.id} segment ${segment}`);
@@ -292,7 +583,11 @@ class BatchSendingService {
                 const filter = segmentFilter + `+id:<'${lastId}'`;
                 logging.info(`Fetching members batch for email ${email.id} segment ${segment}, lastId: ${lastId} ${filter}`);
 
-                members = await this.#models.Member.getFilteredCollectionQuery({filter})
+                members = await this.#getMembersQuery({
+                    filter,
+                    emailId: email.id,
+                    excludeExistingRecipients
+                })
                     .orderByRaw('id DESC')
                     .select('members.id', 'members.uuid', 'members.email', 'members.name').limit(BATCH_SIZE + 1);
 
@@ -338,7 +633,8 @@ class BatchSendingService {
             }
         }
 
-        logging.info(`Created ${batches.length} batches for email ${email.id} with ${totalCount} recipients`);
+        const createdRecipientCount = totalCount - initialRecipientCount;
+        logging.info(`Created ${batches.length} batches for email ${email.id} with ${createdRecipientCount} new recipients (${totalCount} total)`);
 
         if (email.get('email_count') !== totalCount) {
             logging.error(`Email ${email.id} has wrong stored email_count ${email.get('email_count')}, did expect ${totalCount}. Updating the model.`);
@@ -414,14 +710,7 @@ class BatchSendingService {
 
         logging.info(`Creating batch for email ${email.id} segment ${segment} with ${members.length} members`);
 
-        const batch = await this.#models.EmailBatch.add({
-            email_id: email.id,
-            member_segment: segment,
-            status: 'pending',
-            fallback_sending_domain: Boolean(options.useFallbackDomain)
-        }, options);
-
-        const recipientData = [];
+        const recipientsToPersist = [];
 
         members.forEach((memberRow) => {
             if (!memberRow.id || !memberRow.uuid || !memberRow.email) {
@@ -429,15 +718,33 @@ class BatchSendingService {
                 return;
             }
 
-            recipientData.push({
+            recipientsToPersist.push({
+                memberId: memberRow.id,
+                memberUuid: memberRow.uuid,
+                memberEmail: memberRow.email,
+                memberName: memberRow.name
+            });
+        });
+
+        const recipientManifest = this.#createRecipientManifest(recipientsToPersist.map(recipient => recipient.memberId));
+        const batch = await this.#models.EmailBatch.add({
+            email_id: email.id,
+            member_segment: segment,
+            status: 'pending',
+            fallback_sending_domain: Boolean(options.useFallbackDomain),
+            recipient_count: recipientManifest.recipientCount,
+            recipient_hash: recipientManifest.recipientHash
+        }, options);
+        const recipientData = recipientsToPersist.map((recipient) => {
+            return {
                 id: ObjectID().toHexString(),
                 email_id: email.id,
-                member_id: memberRow.id,
+                member_id: recipient.memberId,
                 batch_id: batch.id,
-                member_uuid: memberRow.uuid,
-                member_email: memberRow.email,
-                member_name: memberRow.name
-            });
+                member_uuid: recipient.memberUuid,
+                member_email: recipient.memberEmail,
+                member_name: recipient.memberName
+            };
         });
 
         const insertQuery = this.#db.knex('email_recipients').insert(recipientData);
@@ -477,11 +784,10 @@ class BatchSendingService {
         const emailBodyCache = new Map();
 
         // Spread batches across the target window if one is configured. `deliveryTimes`
-        // handles the past-deadline case internally (resume of an interrupted send or a
-        // delayed job): if the original `created_at + targetDeliveryWindow` deadline has
-        // passed, the function respreads remaining batches over a fresh window starting
-        // now instead of returning undefined for every batch (which would dump every
-        // remaining batch into Mailgun in the same second and break the rate-spread).
+        // handles a past deadline internally. Explicit partial continuations derive their
+        // deadline from the persisted transition timestamp; ordinary sends continue to
+        // derive it from `created_at`. In either case, a genuinely delayed job respreads
+        // remaining batches over a fresh window rather than dumping them into Mailgun.
         const targetDeliveryWindow = this.#sendingService.getTargetDeliveryWindow();
         const shouldApplyDeliveryTimes = targetDeliveryWindow !== undefined && targetDeliveryWindow > 0;
         const deliveryTimes = this.calculateDeliveryTimes(email, batches.length);
@@ -712,9 +1018,10 @@ class BatchSendingService {
      * @param {string} id id of the model
      * @param {string} status set the status of the model to this value
      * @param {string[]} allowedStatuses Check if the models current status is one of these values
+     * @param {object} [data] Additional fields persisted atomically with the status transition
      * @returns {Promise<object|undefined>} The updated model. Undefined if the model didn't pass the status check.
      */
-    async updateStatusLock(Model, id, status, allowedStatuses) {
+    async updateStatusLock(Model, id, status, allowedStatuses, data = {}) {
         let model;
         await Model.transaction(async (transacting) => {
             model = await Model.findOne({id}, {require: true, transacting, forUpdate: true});
@@ -723,6 +1030,7 @@ class BatchSendingService {
                 return;
             }
             await model.save({
+                ...data,
                 status
             }, {patch: true, transacting, autoRefresh: false});
         });
@@ -799,24 +1107,44 @@ class BatchSendingService {
     }
 
     /**
-     * Returns the sending deadline for an email
-     * Based on the email.created_at timestamp and the configured target delivery window
+     * Returns the sending deadline for an email.
+     * Explicit partial continuations begin their delivery window at the persisted
+     * `updated_at` state transition; ordinary emails retain `created_at` semantics.
      * @param {*} email
      * @returns Date | undefined
      */
     getDeliveryDeadline(email) {
+        const isPartialResume = email.get('partial_resume') === true;
+        const startTime = isPartialResume
+            ? email.get('updated_at')
+            : email.get('created_at');
+        const isValidDateValue = startTime instanceof Date ||
+            (typeof startTime === 'string' && startTime.trim().length > 0) ||
+            typeof startTime === 'number';
+        const startTimeMs = isValidDateValue ? new Date(startTime).getTime() : NaN;
+
+        // `updated_at` is nullable in the historic schema. A partial continuation
+        // without a valid persisted transition is ambiguous: it must fail before
+        // any provider dispatch rather than silently disabling rate-spread.
+        if (isPartialResume && !Number.isFinite(startTimeMs)) {
+            throw new errors.EmailError({
+                message: `Cannot send partial continuation ${email.id}: persisted transition timestamp updated_at is missing or invalid`
+            });
+        }
+
+        // Preserve existing normal-email behavior if old data has no usable
+        // creation timestamp.
+        if (!Number.isFinite(startTimeMs)) {
+            return undefined;
+        }
+
         // Return undefined if targetDeliveryWindow is 0 (or less)
         const targetDeliveryWindow = this.#sendingService.getTargetDeliveryWindow();
         if (targetDeliveryWindow === undefined || targetDeliveryWindow <= 0) {
             return undefined;
         }
-        try {
-            const startTime = email.get('created_at');
-            const deadline = new Date(startTime.getTime() + targetDeliveryWindow);
-            return deadline;
-        } catch (err) {
-            return undefined;
-        }
+
+        return new Date(startTimeMs + targetDeliveryWindow);
     }
 
     /**
@@ -830,11 +1158,10 @@ class BatchSendingService {
             return new Array(numBatches).fill(undefined);
         }
         const now = new Date();
-        // If the original `created_at + targetDeliveryWindow` deadline has passed (resume
-        // of an interrupted send, or a job that was delayed for any reason), respread
-        // batches over a fresh window of the same size starting now. Otherwise a
-        // 50%-resumed 10-minute send would dump every remaining batch into Mailgun in
-        // the same second and defeat the rate-spread.
+        // If the current delivery window has passed (an interrupted continuation or
+        // delayed job), respread batches over a fresh window of the same size starting
+        // now. Partial continuations normally use their persisted `updated_at` transition
+        // as the window start, so an old campaign does not automatically enter this branch.
         if (now >= deadline) {
             const targetDeliveryWindow = this.#sendingService.getTargetDeliveryWindow();
             deadline = new Date(now.getTime() + targetDeliveryWindow);

@@ -74,6 +74,24 @@ const controller = {
         }
     },
 
+    partialResume: {
+        headers: {
+            cacheInvalidate: false
+        },
+        data: [
+            'id'
+        ],
+        // This is a distinct operation and route, but it deliberately requires the
+        // existing staff permission for retrying an email rather than inventing a
+        // new implicit permission method named after this endpoint.
+        permissions: {
+            method: 'retry'
+        },
+        async query(frame) {
+            return await emailService.controller.resumePartialEmail(frame);
+        }
+    },
+
     browseBatches: {
         headers: {
             cacheInvalidate: false
