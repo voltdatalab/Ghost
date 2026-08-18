@@ -1,8 +1,105 @@
 const EmailService = require('../../../../../core/server/services/email-service/email-service');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const sinon = require('sinon');
 const logging = require('@tryghost/logging');
+const {canonicalizeLegacyProofPayload, hashStringList} = require('../../../../../core/server/services/email-service/legacy-partial-resume-proof');
 const {createModel, createModelClass} = require('./utils');
+
+const LEGACY_PUBLIC_KEY_CONFIG = 'bulkEmail:partialResume:legacyProxyPublicKey';
+const LEGACY_EMAIL_ID = '64b000000000000000000001';
+const LEGACY_BATCH_IDS = ['64b000000000000000000002', '64b000000000000000000003'];
+const LEGACY_MEMBER_IDS = ['64b000000000000000000010', '64b000000000000000000011'];
+const LEGACY_MEMBER_EMAILS = ['first@example.test', 'second@example.test'];
+const PARTIAL_RESUME_ENQUEUE_CLAIM = '00000000-0000-4000-8000-000000000001';
+const LEGACY_PROOF_KEY_PAIR = crypto.generateKeyPairSync('ed25519');
+
+function createSignedLegacyProof({
+    emailId = LEGACY_EMAIL_ID,
+    batchIds = LEGACY_BATCH_IDS,
+    memberIds = LEGACY_MEMBER_IDS,
+    memberEmails = LEGACY_MEMBER_EMAILS,
+    recipientTuples,
+    issuedAt = new Date(Date.now() - 1000),
+    proxyLastCreatedAt = new Date(Date.now() - 2000)
+} = {}) {
+    const canonicalRecipientTuples = recipientTuples || batchIds.map((batchId, index) => `${batchId}\u0000${memberIds[index]}\u0000${memberEmails[index]}`);
+    const payload = {
+        version: 1,
+        transport: 'ses-proxy-mailgun-v1',
+        email_id: emailId,
+        issued_at: issuedAt.toISOString(),
+        legacy_batch_ids: [...batchIds],
+        legacy_provider_id_mode: 'email-id',
+        ledger_member_count: memberIds.length,
+        ledger_member_hash: hashStringList(memberIds),
+        ledger_email_count: memberEmails.length,
+        ledger_email_hash: hashStringList(memberEmails),
+        ledger_binding_hash: hashStringList(canonicalRecipientTuples),
+        proxy_input_count: memberEmails.length,
+        proxy_input_hash: hashStringList(memberEmails),
+        proxy_sent_count: memberEmails.length,
+        proxy_sent_hash: hashStringList(memberEmails),
+        proxy_site_count: 1,
+        proxy_batch_count: batchIds.length,
+        proxy_first_created_at: proxyLastCreatedAt.toISOString(),
+        proxy_last_created_at: proxyLastCreatedAt.toISOString()
+    };
+    const {payloadJson} = canonicalizeLegacyProofPayload(payload);
+    return {
+        proof: payload,
+        signature: crypto.sign(null, Buffer.from(payloadJson, 'utf8'), LEGACY_PROOF_KEY_PAIR.privateKey).toString('base64url'),
+        payloadJson
+    };
+}
+
+function createLegacyProofDatabase({batches = [], recipients = [], existingProof} = {}) {
+    const state = {
+        batches,
+        recipients,
+        existingProof,
+        insertedProofs: [],
+        calls: []
+    };
+    const db = {
+        knex(table) {
+            state.calls.push(table);
+            const query = {
+                select() {
+                    return query;
+                },
+                where() {
+                    return query;
+                },
+                forUpdate() {
+                    return query;
+                },
+                transacting() {
+                    return query;
+                },
+                first() {
+                    return Promise.resolve(table === 'email_partial_resume_proofs' ? state.existingProof : undefined);
+                },
+                insert(row) {
+                    if (table !== 'email_partial_resume_proofs') {
+                        throw new Error(`Unexpected insert into ${table}`);
+                    }
+                    state.insertedProofs.push(row);
+                    return {
+                        transacting: async () => undefined
+                    };
+                },
+                then(resolve, reject) {
+                    const rows = table === 'email_batches' ? state.batches : (table === 'email_recipients' ? state.recipients : []);
+                    return Promise.resolve(rows).then(resolve, reject);
+                }
+            };
+            return query;
+        }
+    };
+
+    return {db, state};
+}
 
 describe('Email Service', function () {
     let memberCount, limited, verificicationRequired, service;
@@ -14,6 +111,9 @@ describe('Email Service', function () {
     let scheduleRecurringNewslettersJob;
     let domainWarmingService;
     let getMembersCount;
+    let configValues;
+    let legacyProofDatabase;
+    let Email;
 
     beforeEach(function () {
         memberCount = 123;
@@ -23,7 +123,10 @@ describe('Email Service', function () {
         };
         verificicationRequired = false;
         scheduleEmail = sinon.stub().returns();
-        assertCanStartPartialResume = sinon.stub().resolves({missingRecipientCount: 1});
+        assertCanStartPartialResume = sinon.stub().resolves({
+            missingRecipientCount: 1,
+            renderHash: 'a'.repeat(64)
+        });
         updateStatusLock = sinon.stub().resolves(createModel({
             id: 'locked-email-id',
             status: 'pending',
@@ -80,6 +183,9 @@ describe('Email Service', function () {
             getWarmupLimit: sinon.stub()
         };
         getMembersCount = sinon.stub().callsFake(() => Promise.resolve(memberCount));
+        configValues = {};
+        legacyProofDatabase = createLegacyProofDatabase();
+        Email = createModelClass();
 
         service = new EmailService({
             emailSegmenter: {
@@ -106,7 +212,7 @@ describe('Email Service', function () {
                 }
             },
             models: {
-                Email: createModelClass()
+                Email
             },
             batchSendingService: {
                 scheduleEmail,
@@ -120,7 +226,13 @@ describe('Email Service', function () {
             emailAnalyticsJobs: {
                 scheduleRecurringNewslettersJob
             },
-            domainWarmingService: domainWarmingService
+            domainWarmingService: domainWarmingService,
+            db: legacyProofDatabase.db,
+            config: {
+                get(key) {
+                    return configValues[key];
+                }
+            }
         });
     });
 
@@ -496,11 +608,15 @@ describe('Email Service', function () {
             });
 
             scheduleEmail.throws(new Error('Test error'));
+            updateStatusLock.resolves(createModel({
+                status: 'failed',
+                error: 'Something went wrong while scheduling the email'
+            }));
 
             const email = await service.createEmail(post);
             sinon.assert.calledOnce(scheduleEmail);
 
-            assert.equal(email.get('error'), 'Test error');
+            assert.equal(email.get('error'), 'Something went wrong while scheduling the email');
             assert.equal(email.get('status'), 'failed');
         });
 
@@ -514,6 +630,10 @@ describe('Email Service', function () {
             });
 
             scheduleEmail.throws(new Error());
+            updateStatusLock.resolves(createModel({
+                status: 'failed',
+                error: 'Something went wrong while scheduling the email'
+            }));
 
             const email = await service.createEmail(post);
             sinon.assert.calledOnce(scheduleEmail);
@@ -535,6 +655,59 @@ describe('Email Service', function () {
             await assert.rejects(service.createEmail(post));
             sinon.assert.notCalled(scheduleEmail);
         });
+
+        it('awaits a rejected normal enqueue and atomically marks only the pending email failed', async function () {
+            const post = createModel({
+                id: '123',
+                newsletter: createModel({
+                    status: 'active',
+                    feedback_enabled: true
+                })
+            });
+            const createdEmail = createModel({id: 'normal-create-email', status: 'pending'});
+            Email.add = sinon.stub().resolves(createdEmail);
+            scheduleEmail.rejects(new Error('scheduler implementation detail'));
+            updateStatusLock.callsFake(async (Model, id, status, allowedStatuses, data) => {
+                assert.equal(Model, Email);
+                assert.equal(id, createdEmail.id);
+                assert.equal(status, 'failed');
+                assert.deepEqual(allowedStatuses, ['pending']);
+                await createdEmail.save({...data, status}, {patch: true});
+                return createdEmail;
+            });
+
+            const email = await service.createEmail(post);
+
+            assert.equal(email.get('status'), 'failed');
+            assert.equal(email.get('error'), 'Something went wrong while scheduling the email');
+            sinon.assert.calledOnceWithExactly(scheduleEmail, createdEmail);
+        });
+
+        it('does not clobber a normal email if its worker claims submitting before enqueue rejection', async function () {
+            const post = createModel({
+                id: '123',
+                newsletter: createModel({
+                    status: 'active',
+                    feedback_enabled: true
+                })
+            });
+            const createdEmail = createModel({id: 'normal-create-email', status: 'pending'});
+            Email.add = sinon.stub().resolves(createdEmail);
+            scheduleEmail.rejects(new Error('scheduler implementation detail'));
+            updateStatusLock.resolves(undefined);
+
+            await assert.rejects(service.createEmail(post), /Something went wrong while scheduling the email/);
+
+            sinon.assert.calledOnceWithExactly(
+                updateStatusLock,
+                Email,
+                createdEmail.id,
+                'failed',
+                ['pending'],
+                {error: 'Something went wrong while scheduling the email'}
+            );
+            assert.equal(createdEmail.get('status'), 'pending');
+        });
     });
 
     describe('Retry email', function () {
@@ -549,6 +722,30 @@ describe('Email Service', function () {
 
             await service.retryEmail(email);
             sinon.assert.calledOnce(scheduleEmail);
+        });
+
+        it('awaits a rejected retry enqueue and atomically restores failed state', async function () {
+            const email = createModel({
+                id: 'normal-retry-email',
+                status: 'failed',
+                error: 'previous send failure',
+                post: createModel({status: 'published'})
+            });
+            scheduleEmail.rejects(new Error('scheduler implementation detail'));
+            updateStatusLock.callsFake(async (Model, id, status, allowedStatuses, data) => {
+                assert.equal(Model, Email);
+                assert.equal(id, email.id);
+                assert.equal(status, 'failed');
+                assert.deepEqual(allowedStatuses, ['pending']);
+                await email.save({...data, status}, {patch: true});
+                return email;
+            });
+
+            const result = await service.retryEmail(email);
+
+            assert.equal(result.get('status'), 'failed');
+            assert.equal(result.get('error'), 'Something went wrong while scheduling the email');
+            sinon.assert.calledOnceWithExactly(scheduleEmail, email);
         });
 
         it('Does not schedule email again if draft', async function () {
@@ -603,19 +800,213 @@ describe('Email Service', function () {
                 status: 'pending',
                 partial_resume: true
             });
-            updateStatusLock.resolves(lockedEmail);
+            const claimedEmail = createModel({
+                id: 'email-id',
+                status: 'submitting',
+                partial_resume: true,
+                partial_resume_enqueue_claim: 'claim'
+            });
+            updateStatusLock.onFirstCall().resolves(lockedEmail);
+            updateStatusLock.onSecondCall().resolves(claimedEmail);
 
             const result = await service.resumePartialEmail(email);
 
             sinon.assert.calledOnceWithExactly(assertCanStartPartialResume, email);
-            sinon.assert.calledOnce(updateStatusLock);
+            assert.equal(updateStatusLock.callCount, 2);
             const [, emailId, status, allowedStatuses, patch] = updateStatusLock.firstCall.args;
             assert.equal(emailId, 'email-id');
             assert.equal(status, 'pending');
             assert.deepEqual(allowedStatuses, ['submitted']);
-            assert.deepEqual(patch, {partial_resume: true, error: null});
-            sinon.assert.calledOnceWithExactly(scheduleEmail, lockedEmail);
+            assert.deepEqual(patch, {
+                partial_resume: true,
+                partial_resume_render_hash: 'a'.repeat(64),
+                partial_resume_enqueue_claim: null,
+                error: null
+            });
+            sinon.assert.calledWithExactly(
+                updateStatusLock,
+                sinon.match.any,
+                'email-id',
+                'submitting',
+                ['pending'],
+                {error: null, partial_resume_enqueue_claim: sinon.match.string},
+                {
+                    expectedPartialResume: true,
+                    expectedError: null,
+                    expectedPartialResumeEnqueueClaim: null
+                }
+            );
+            sinon.assert.calledOnceWithExactly(scheduleEmail, claimedEmail, {
+                partialResumeClaimed: true,
+                partialResumeClaim: sinon.match.string
+            });
+            const durableClaim = updateStatusLock.secondCall.args[4].partial_resume_enqueue_claim;
+            assert.match(durableClaim, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+            assert.equal(scheduleEmail.firstCall.args[1].partialResumeClaim, durableClaim);
             assert.equal(result, lockedEmail);
+        });
+
+        it('fails the partial continuation with a sanitized error when enqueueing throws after the lock', async function () {
+            const email = createModel({
+                id: 'email-id',
+                status: 'submitted',
+                partial_resume: false
+            });
+            const pendingEmail = createModel({
+                id: 'email-id',
+                status: 'pending',
+                partial_resume: true
+            });
+            const failedEmail = createModel({
+                id: 'email-id',
+                status: 'failed',
+                partial_resume: true,
+                error: 'Something went wrong while scheduling the partial continuation'
+            });
+            const claimedEmail = createModel({
+                id: 'email-id',
+                status: 'submitting',
+                partial_resume: true
+            });
+            updateStatusLock.onFirstCall().resolves(pendingEmail);
+            updateStatusLock.onSecondCall().resolves(claimedEmail);
+            updateStatusLock.onThirdCall().resolves(failedEmail);
+            scheduleEmail.throws(new Error('scheduler implementation detail'));
+
+            const result = await service.resumePartialEmail(email);
+
+            assert.equal(result, failedEmail);
+            assert.equal(updateStatusLock.callCount, 3);
+            sinon.assert.calledWithExactly(
+                updateStatusLock,
+                sinon.match.any,
+                'email-id',
+                'failed',
+                ['submitting'],
+                {
+                    error: 'Something went wrong while scheduling the partial continuation',
+                    partial_resume_enqueue_claim: null
+                },
+                {
+                    expectedPartialResume: true,
+                    expectedError: null,
+                    expectedPartialResumeEnqueueClaim: sinon.match.string
+                }
+            );
+            sinon.assert.calledOnceWithExactly(scheduleEmail, claimedEmail, {
+                partialResumeClaimed: true,
+                partialResumeClaim: sinon.match.string
+            });
+            const durableClaim = updateStatusLock.secondCall.args[4].partial_resume_enqueue_claim;
+            assert.match(durableClaim, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+            assert.equal(scheduleEmail.firstCall.args[1].partialResumeClaim, durableClaim);
+        });
+
+        it('fails the partial continuation with a sanitized error when enqueueing rejects after the lock', async function () {
+            const email = createModel({
+                id: 'email-id',
+                status: 'submitted',
+                partial_resume: false
+            });
+            const pendingEmail = createModel({
+                id: 'email-id',
+                status: 'pending',
+                partial_resume: true
+            });
+            const failedEmail = createModel({
+                id: 'email-id',
+                status: 'failed',
+                partial_resume: true,
+                error: 'Something went wrong while scheduling the partial continuation'
+            });
+            const claimedEmail = createModel({
+                id: 'email-id',
+                status: 'submitting',
+                partial_resume: true
+            });
+            updateStatusLock.onFirstCall().resolves(pendingEmail);
+            updateStatusLock.onSecondCall().resolves(claimedEmail);
+            updateStatusLock.onThirdCall().resolves(failedEmail);
+            scheduleEmail.rejects(new Error('scheduler implementation detail'));
+
+            const result = await service.resumePartialEmail(email);
+
+            assert.equal(result, failedEmail);
+            assert.equal(updateStatusLock.callCount, 3);
+            sinon.assert.calledWithExactly(
+                updateStatusLock,
+                sinon.match.any,
+                'email-id',
+                'failed',
+                ['submitting'],
+                {
+                    error: 'Something went wrong while scheduling the partial continuation',
+                    partial_resume_enqueue_claim: null
+                },
+                {
+                    expectedPartialResume: true,
+                    expectedError: null,
+                    expectedPartialResumeEnqueueClaim: sinon.match.string
+                }
+            );
+            sinon.assert.calledOnceWithExactly(scheduleEmail, claimedEmail, {
+                partialResumeClaimed: true,
+                partialResumeClaim: sinon.match.string
+            });
+            const durableClaim = updateStatusLock.secondCall.args[4].partial_resume_enqueue_claim;
+            assert.match(durableClaim, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+            assert.equal(scheduleEmail.firstCall.args[1].partialResumeClaim, durableClaim);
+        });
+
+        it('does not clobber a partial continuation claimed while its enqueue throws', async function () {
+            const email = createModel({
+                id: 'email-id',
+                status: 'submitted',
+                partial_resume: false
+            });
+            const pendingEmail = createModel({
+                id: 'email-id',
+                status: 'pending',
+                partial_resume: true
+            });
+            const claimedEmail = createModel({
+                id: 'email-id',
+                status: 'submitting',
+                partial_resume: true
+            });
+            updateStatusLock.onFirstCall().resolves(pendingEmail);
+            updateStatusLock.onSecondCall().resolves(claimedEmail);
+            // Simulates an accepted job that already swapped the enqueue claim
+            // for a worker claim before addJob reports an error.
+            updateStatusLock.onThirdCall().resolves(undefined);
+            scheduleEmail.throws(new Error('scheduler implementation detail'));
+
+            await assert.rejects(service.resumePartialEmail(email), /Something went wrong while scheduling the partial continuation/);
+
+            assert.equal(updateStatusLock.callCount, 3);
+            sinon.assert.calledWithExactly(
+                updateStatusLock,
+                sinon.match.any,
+                'email-id',
+                'failed',
+                ['submitting'],
+                {
+                    error: 'Something went wrong while scheduling the partial continuation',
+                    partial_resume_enqueue_claim: null
+                },
+                {
+                    expectedPartialResume: true,
+                    expectedError: null,
+                    expectedPartialResumeEnqueueClaim: sinon.match.string
+                }
+            );
+            sinon.assert.calledOnceWithExactly(scheduleEmail, claimedEmail, {
+                partialResumeClaimed: true,
+                partialResumeClaim: sinon.match.string
+            });
+            const durableClaim = updateStatusLock.secondCall.args[4].partial_resume_enqueue_claim;
+            assert.match(durableClaim, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+            assert.equal(scheduleEmail.firstCall.args[1].partialResumeClaim, durableClaim);
         });
 
         it('allows only the explicit partial route to re-open a safe failed continuation', async function () {
@@ -629,7 +1020,13 @@ describe('Email Service', function () {
                 status: 'pending',
                 partial_resume: true
             });
-            updateStatusLock.resolves(lockedEmail);
+            const claimedEmail = createModel({
+                id: 'email-id',
+                status: 'submitting',
+                partial_resume: true
+            });
+            updateStatusLock.onFirstCall().resolves(lockedEmail);
+            updateStatusLock.onSecondCall().resolves(claimedEmail);
 
             const result = await service.resumePartialEmail(email);
 
@@ -638,8 +1035,19 @@ describe('Email Service', function () {
             assert.equal(emailId, 'email-id');
             assert.equal(status, 'pending');
             assert.deepEqual(allowedStatuses, ['failed']);
-            assert.deepEqual(patch, {partial_resume: true, error: null});
-            sinon.assert.calledOnceWithExactly(scheduleEmail, lockedEmail);
+            assert.deepEqual(patch, {
+                partial_resume: true,
+                partial_resume_render_hash: 'a'.repeat(64),
+                partial_resume_enqueue_claim: null,
+                error: null
+            });
+            sinon.assert.calledOnceWithExactly(scheduleEmail, claimedEmail, {
+                partialResumeClaimed: true,
+                partialResumeClaim: sinon.match.string
+            });
+            const durableClaim = updateStatusLock.secondCall.args[4].partial_resume_enqueue_claim;
+            assert.match(durableClaim, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+            assert.equal(scheduleEmail.firstCall.args[1].partialResumeClaim, durableClaim);
             assert.equal(result, lockedEmail);
         });
 
@@ -682,6 +1090,172 @@ describe('Email Service', function () {
         });
     });
 
+    describe('Legacy partial-resume proof admission', function () {
+        function configureAdmission({
+            status = 'submitted',
+            partialResume = false,
+            batches = [
+                {id: LEGACY_BATCH_IDS[0], email_id: LEGACY_EMAIL_ID, status: 'submitted', provider_id: LEGACY_EMAIL_ID},
+                {id: LEGACY_BATCH_IDS[1], email_id: LEGACY_EMAIL_ID, status: 'submitted', provider_id: LEGACY_EMAIL_ID}
+            ],
+            recipients = [
+                {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[0]},
+                {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[1]}
+            ],
+            existingProof
+        } = {}) {
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                status,
+                partial_resume: partialResume
+            });
+            Email.findOne = sinon.stub().resolves(email);
+            configValues[LEGACY_PUBLIC_KEY_CONFIG] = LEGACY_PROOF_KEY_PAIR.publicKey.export({type: 'spki', format: 'pem'});
+            legacyProofDatabase.state.batches = batches;
+            legacyProofDatabase.state.recipients = recipients;
+            legacyProofDatabase.state.existingProof = existingProof;
+            return email;
+        }
+
+        it('persists exactly one reconciled proof without scheduling or changing the submitted email', async function () {
+            const email = configureAdmission();
+            const {proof, signature, payloadJson} = createSignedLegacyProof();
+
+            const result = await service.admitLegacyPartialResumeProof(email, {proof, signature});
+
+            assert.equal(result, email);
+            sinon.assert.calledOnceWithExactly(Email.findOne, {id: LEGACY_EMAIL_ID}, {
+                require: true,
+                transacting: {transacting: 'transacting'},
+                forUpdate: true
+            });
+            assert.equal(legacyProofDatabase.state.insertedProofs.length, 1);
+            const [persisted] = legacyProofDatabase.state.insertedProofs;
+            assert.match(persisted.id, /^[a-f0-9]{24}$/);
+            assert.equal(persisted.email_id, LEGACY_EMAIL_ID);
+            assert.equal(persisted.proof_payload, payloadJson);
+            assert.equal(persisted.proof_hash, crypto.createHash('sha256').update(payloadJson, 'utf8').digest('hex'));
+            assert.equal(persisted.signature, signature);
+            assert.equal(persisted.transport, 'ses-proxy-mailgun-v1');
+            assert.match(persisted.signing_key_fingerprint, /^[a-f0-9]{64}$/);
+            assert.ok(persisted.created_at instanceof Date);
+            assert.equal(email.get('status'), 'submitted');
+            assert.equal(email.get('partial_resume'), false);
+            sinon.assert.notCalled(scheduleEmail);
+        });
+
+        it('rejects a missing public key before reading or writing the database', async function () {
+            const email = createModel({id: LEGACY_EMAIL_ID, status: 'submitted', partial_resume: false});
+            const {proof, signature} = createSignedLegacyProof();
+
+            await assert.rejects(
+                service.admitLegacyPartialResumeProof(email, {proof, signature}),
+                error => error.statusCode === 400 && /configured/i.test(error.message)
+            );
+            assert.deepEqual(legacyProofDatabase.state.calls, []);
+            assert.deepEqual(legacyProofDatabase.state.insertedProofs, []);
+            sinon.assert.notCalled(scheduleEmail);
+        });
+
+        it('rejects invalid, stale, and unknown-transport proofs before a database write', async function () {
+            const email = configureAdmission();
+            const valid = createSignedLegacyProof();
+            const unknownTransport = {...valid.proof, transport: 'unknown-transport'};
+            const stale = createSignedLegacyProof({
+                issuedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+                proxyLastCreatedAt: new Date(Date.now() - (48 * 60 * 60 * 1000) - 1000)
+            });
+
+            await assert.rejects(service.admitLegacyPartialResumeProof(email, {proof: valid.proof, signature: Buffer.alloc(64).toString('base64url')}), error => error.statusCode === 400);
+            await assert.rejects(service.admitLegacyPartialResumeProof(email, stale), error => error.statusCode === 400 && /stale/i.test(error.message));
+            await assert.rejects(service.admitLegacyPartialResumeProof(email, {proof: unknownTransport, signature: valid.signature}), error => error.statusCode === 400 && /transport/i.test(error.message));
+
+            assert.deepEqual(legacyProofDatabase.state.calls, []);
+            assert.deepEqual(legacyProofDatabase.state.insertedProofs, []);
+            sinon.assert.notCalled(scheduleEmail);
+        });
+
+        it('rejects a submitted proof when any batch is outside the signed legacy prefix', async function () {
+            const email = configureAdmission({
+                batches: [
+                    {id: LEGACY_BATCH_IDS[0], email_id: LEGACY_EMAIL_ID, status: 'submitted', provider_id: LEGACY_EMAIL_ID},
+                    {id: LEGACY_BATCH_IDS[1], email_id: LEGACY_EMAIL_ID, status: 'submitted', provider_id: LEGACY_EMAIL_ID},
+                    {id: '64b000000000000000000004', email_id: LEGACY_EMAIL_ID, status: 'submitted', provider_id: LEGACY_EMAIL_ID}
+                ]
+            });
+            const signedProof = createSignedLegacyProof();
+
+            await assert.rejects(service.admitLegacyPartialResumeProof(email, signedProof), error => error.statusCode === 400 && /batch/i.test(error.message));
+            assert.deepEqual(legacyProofDatabase.state.insertedProofs, []);
+            sinon.assert.notCalled(scheduleEmail);
+        });
+
+        it('rejects mismatched provider batches and duplicate recipient ledger identities', async function () {
+            const providerMismatchEmail = configureAdmission({
+                batches: [
+                    {id: LEGACY_BATCH_IDS[0], email_id: LEGACY_EMAIL_ID, status: 'submitted', provider_id: LEGACY_EMAIL_ID},
+                    {id: LEGACY_BATCH_IDS[1], email_id: LEGACY_EMAIL_ID, status: 'submitted', provider_id: 'unexpected-provider-id'}
+                ]
+            });
+            const signedProof = createSignedLegacyProof();
+
+            await assert.rejects(service.admitLegacyPartialResumeProof(providerMismatchEmail, signedProof), error => error.statusCode === 400 && /batch/i.test(error.message));
+            assert.deepEqual(legacyProofDatabase.state.insertedProofs, []);
+
+            const duplicateLedgerEmail = configureAdmission({
+                recipients: [
+                    {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[0]},
+                    {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[1]}
+                ]
+            });
+            await assert.rejects(service.admitLegacyPartialResumeProof(duplicateLedgerEmail, signedProof), error => error.statusCode === 400 && /duplicate/i.test(error.message));
+            assert.deepEqual(legacyProofDatabase.state.insertedProofs, []);
+            sinon.assert.notCalled(scheduleEmail);
+        });
+
+        it('rejects signed proofs whose email identity or recipient ledger hash differs from Ghost', async function () {
+            const email = configureAdmission();
+            const wrongEmailProof = createSignedLegacyProof({emailId: '64b000000000000000000099'});
+
+            await assert.rejects(service.admitLegacyPartialResumeProof(email, wrongEmailProof), error => error.statusCode === 400 && /email/i.test(error.message));
+            assert.deepEqual(legacyProofDatabase.state.calls, []);
+
+            const mismatchedLedgerEmail = configureAdmission({
+                recipients: [
+                    {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: 'changed@example.test'},
+                    {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[1]}
+                ]
+            });
+            const signedProof = createSignedLegacyProof();
+            await assert.rejects(service.admitLegacyPartialResumeProof(mismatchedLedgerEmail, signedProof), error => error.statusCode === 400 && /ledger/i.test(error.message));
+            const swappedRecipientPairEmail = configureAdmission({
+                recipients: [
+                    {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[1]},
+                    {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[0]}
+                ]
+            });
+            await assert.rejects(service.admitLegacyPartialResumeProof(swappedRecipientPairEmail, signedProof), error => error.statusCode === 400 && /ledger/i.test(error.message));
+            assert.deepEqual(legacyProofDatabase.state.insertedProofs, []);
+            sinon.assert.notCalled(scheduleEmail);
+        });
+
+        it('rejects an existing proof, non-submitted email, and already-marked continuation', async function () {
+            const signedProof = createSignedLegacyProof();
+            const existingProofEmail = configureAdmission({existingProof: {id: '64b000000000000000000099'}});
+
+            await assert.rejects(service.admitLegacyPartialResumeProof(existingProofEmail, signedProof), error => error.statusCode === 400 && /already/i.test(error.message));
+            assert.deepEqual(legacyProofDatabase.state.insertedProofs, []);
+
+            const failedEmail = configureAdmission({status: 'failed'});
+            await assert.rejects(service.admitLegacyPartialResumeProof(failedEmail, signedProof), error => error.statusCode === 400 && /submitted/i.test(error.message));
+
+            const partialEmail = configureAdmission({partialResume: true});
+            await assert.rejects(service.admitLegacyPartialResumeProof(partialEmail, signedProof), error => error.statusCode === 400 && /partial/i.test(error.message));
+            assert.deepEqual(legacyProofDatabase.state.insertedProofs, []);
+            sinon.assert.notCalled(scheduleEmail);
+        });
+    });
+
     describe('resumeInterruptedSends', function () {
         // Mock factory that mimics the scanner's filter semantics: legacy rows use
         // `created_at`; explicit partial rows are fetched by their marker and their
@@ -705,11 +1279,13 @@ describe('Email Service', function () {
                 createModel({
                     id: 'good-1',
                     status: 'submitting',
+                    created_at: new Date(),
                     post: createModel({status: 'published'})
                 }),
                 createModel({
                     id: 'bad',
                     status: 'submitting',
+                    created_at: new Date(),
                     get post() {
                         throw new Error('Boom');
                     }
@@ -717,6 +1293,7 @@ describe('Email Service', function () {
                 createModel({
                     id: 'good-2',
                     status: 'submitting',
+                    created_at: new Date(),
                     post: createModel({status: 'sent'})
                 })
             ];
@@ -749,9 +1326,51 @@ describe('Email Service', function () {
 
             sinon.assert.calledTwice(scheduleEmail);
             sinon.assert.calledOnce(errorLog);
+            sinon.assert.calledWith(recoveryStatusLock, sinon.match.any, 'bad', 'failed', ['submitting']);
         });
 
-        it('schedules a pending partial continuation after a crash before its in-memory job starts', async function () {
+        it('fails only its pending claim when legacy recovery scheduling rejects', async function () {
+            const email = createModel({
+                id: 'schedule-throws-after-claim',
+                status: 'submitting',
+                created_at: new Date(),
+                post: createModel({status: 'published'})
+            });
+            const recoveryStatusLock = sinon.stub()
+                .onFirstCall().resolves(createModel({id: email.id, status: 'pending'}))
+                .onSecondCall().resolves(createModel({}));
+            const scheduleRejects = sinon.stub().rejects(new Error('Recovery scheduling failed'));
+            const errorLog = sinon.stub(logging, 'error');
+            const findAll = async ({filter}) => {
+                if (filter.includes('partial_resume:true')) {
+                    return {models: []};
+                }
+                return {models: [email]};
+            };
+            const localService = new EmailService({
+                emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
+                limitService: {isLimited: () => false, errorIfIsOverLimit: () => {}, errorIfWouldGoOverLimit: () => {}},
+                verificationTrigger: {checkVerificationRequired: () => Promise.resolve(false)},
+                models: {Email: {findAll}},
+                batchSendingService: {scheduleEmail: scheduleRejects, updateStatusLock: recoveryStatusLock},
+                settingsCache,
+                emailRenderer,
+                membersRepository,
+                sendingService,
+                emailAnalyticsJobs: {scheduleRecurringNewslettersJob},
+                domainWarmingService
+            });
+
+            await localService.resumeInterruptedSends();
+
+            sinon.assert.calledWith(recoveryStatusLock, sinon.match.any, email.id, 'pending', ['submitting']);
+            sinon.assert.calledWith(recoveryStatusLock, sinon.match.any, email.id, 'failed', ['pending']);
+            assert.equal(recoveryStatusLock.callCount, 2);
+            sinon.assert.calledOnce(scheduleRejects);
+            sinon.assert.calledOnce(errorLog);
+        });
+
+        it('takes a durable marker claim before scheduling a pending partial continuation after a crash', async function () {
             const pendingPartial = createModel({
                 id: 'pending-partial',
                 status: 'pending',
@@ -763,9 +1382,12 @@ describe('Email Service', function () {
             const claimedPartial = createModel({
                 id: pendingPartial.id,
                 status: 'submitting',
-                partial_resume: true
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: PARTIAL_RESUME_ENQUEUE_CLAIM
             });
             const recoveryStatusLock = sinon.stub().resolves(claimedPartial);
+            sinon.stub(crypto, 'randomUUID').returns(PARTIAL_RESUME_ENQUEUE_CLAIM);
             const findAll = async ({filter}) => {
                 if (filter.includes('partial_resume:true')) {
                     return {models: [pendingPartial]};
@@ -773,6 +1395,145 @@ describe('Email Service', function () {
                 return {models: []};
             };
 
+            const localService = new EmailService({
+                emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
+                limitService: {isLimited: () => false, errorIfIsOverLimit: () => {}},
+                verificationTrigger: {checkVerificationRequired: () => Promise.resolve(false)},
+                models: {Email: {findAll}},
+                batchSendingService: {scheduleEmail, updateStatusLock: recoveryStatusLock},
+                settingsCache,
+                emailRenderer,
+                membersRepository,
+                sendingService,
+                emailAnalyticsJobs: {scheduleRecurringNewslettersJob},
+                domainWarmingService
+            });
+
+            await localService.resumeInterruptedSends();
+
+            sinon.assert.calledOnceWithExactly(
+                recoveryStatusLock,
+                sinon.match.any,
+                pendingPartial.id,
+                'submitting',
+                ['pending'],
+                {
+                    error: null,
+                    partial_resume_enqueue_claim: PARTIAL_RESUME_ENQUEUE_CLAIM
+                },
+                {
+                    expectedPartialResume: true,
+                    expectedPartialResumeEnqueueClaim: null
+                }
+            );
+            sinon.assert.calledOnceWithExactly(scheduleEmail, claimedPartial, {
+                partialResumeClaimed: true,
+                partialResumeClaim: PARTIAL_RESUME_ENQUEUE_CLAIM
+            });
+        });
+
+        it('fails only its owned durable partial claim when recovery scheduling rejects', async function () {
+            const pendingPartial = createModel({
+                id: 'partial-schedule-rejects-before-worker-claim',
+                status: 'pending',
+                partial_resume: true,
+                created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+                updated_at: new Date(),
+                post: createModel({status: 'published'})
+            });
+            const claimedPartial = createModel({
+                id: pendingPartial.id,
+                status: 'submitting',
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: PARTIAL_RESUME_ENQUEUE_CLAIM
+            });
+            const recoveryStatusLock = sinon.stub()
+                .onFirstCall().resolves(claimedPartial)
+                .onSecondCall().resolves(createModel({}));
+            sinon.stub(crypto, 'randomUUID').returns(PARTIAL_RESUME_ENQUEUE_CLAIM);
+            const scheduleRejects = sinon.stub().rejects(new Error('Partial recovery scheduling failed'));
+            const errorLog = sinon.stub(logging, 'error');
+            const findAll = async ({filter}) => {
+                if (filter.includes('partial_resume:true')) {
+                    return {models: [pendingPartial]};
+                }
+                return {models: []};
+            };
+            const localService = new EmailService({
+                emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
+                limitService: {isLimited: () => false, errorIfIsOverLimit: () => {}, errorIfWouldGoOverLimit: () => {}},
+                verificationTrigger: {checkVerificationRequired: () => Promise.resolve(false)},
+                models: {Email: {findAll}},
+                batchSendingService: {scheduleEmail: scheduleRejects, updateStatusLock: recoveryStatusLock},
+                settingsCache,
+                emailRenderer,
+                membersRepository,
+                sendingService,
+                emailAnalyticsJobs: {scheduleRecurringNewslettersJob},
+                domainWarmingService
+            });
+
+            await localService.resumeInterruptedSends();
+
+            sinon.assert.calledWithExactly(
+                recoveryStatusLock,
+                sinon.match.any,
+                pendingPartial.id,
+                'submitting',
+                ['pending'],
+                {
+                    error: null,
+                    partial_resume_enqueue_claim: PARTIAL_RESUME_ENQUEUE_CLAIM
+                },
+                {
+                    expectedPartialResume: true,
+                    expectedPartialResumeEnqueueClaim: null
+                }
+            );
+            sinon.assert.calledWithExactly(
+                recoveryStatusLock,
+                sinon.match.any,
+                pendingPartial.id,
+                'failed',
+                ['submitting'],
+                {
+                    error: 'Something went wrong while scheduling the partial continuation',
+                    partial_resume_enqueue_claim: null
+                },
+                {
+                    expectedPartialResume: true,
+                    expectedPartialResumeEnqueueClaim: PARTIAL_RESUME_ENQUEUE_CLAIM
+                }
+            );
+            assert.equal(recoveryStatusLock.callCount, 2);
+            sinon.assert.calledOnceWithExactly(scheduleRejects, claimedPartial, {
+                partialResumeClaimed: true,
+                partialResumeClaim: PARTIAL_RESUME_ENQUEUE_CLAIM
+            });
+            sinon.assert.calledOnce(errorLog);
+        });
+
+        it('fails a pending partial continuation when its post lookup throws', async function () {
+            const pendingPartial = createModel({
+                id: 'broken-pending-partial',
+                status: 'pending',
+                partial_resume: true,
+                created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+                updated_at: new Date(),
+                post: createModel({status: 'published'})
+            });
+            pendingPartial.getLazyRelation = () => {
+                throw new Error('Broken partial post relation');
+            };
+            const recoveryStatusLock = sinon.stub().resolves(createModel({}));
+            const errorLog = sinon.stub(logging, 'error');
+            const findAll = async ({filter}) => {
+                if (filter.includes('partial_resume:true')) {
+                    return {models: [pendingPartial]};
+                }
+                return {models: []};
+            };
             const localService = new EmailService({
                 emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
                 limitService: {isLimited: () => false, errorIfIsOverLimit: () => {}, errorIfWouldGoOverLimit: () => {}},
@@ -789,11 +1550,23 @@ describe('Email Service', function () {
 
             await localService.resumeInterruptedSends();
 
-            sinon.assert.calledOnceWithExactly(recoveryStatusLock, sinon.match.any, pendingPartial.id, 'submitting', ['pending']);
-            sinon.assert.calledOnceWithExactly(scheduleEmail, claimedPartial, {partialResumeClaimed: true});
+            sinon.assert.calledOnceWithExactly(
+                recoveryStatusLock,
+                sinon.match.any,
+                pendingPartial.id,
+                'failed',
+                ['pending'],
+                {partial_resume_enqueue_claim: null},
+                {
+                    expectedPartialResume: true,
+                    expectedPartialResumeEnqueueClaim: null
+                }
+            );
+            sinon.assert.notCalled(scheduleEmail);
+            sinon.assert.calledOnce(errorLog);
         });
 
-        it('does not enqueue a pending partial continuation after another scanner claims it', async function () {
+        it('does not enqueue a pending partial continuation after another scanner owns its durable claim', async function () {
             const pendingPartial = createModel({
                 id: 'already-claimed',
                 status: 'pending',
@@ -803,6 +1576,7 @@ describe('Email Service', function () {
                 post: createModel({status: 'published'})
             });
             const recoveryStatusLock = sinon.stub().resolves(undefined);
+            sinon.stub(crypto, 'randomUUID').returns(PARTIAL_RESUME_ENQUEUE_CLAIM);
             const findAll = async ({filter}) => {
                 if (filter.includes('partial_resume:true')) {
                     return {models: [pendingPartial]};
@@ -826,8 +1600,105 @@ describe('Email Service', function () {
 
             await localService.resumeInterruptedSends();
 
-            sinon.assert.calledOnceWithExactly(recoveryStatusLock, sinon.match.any, pendingPartial.id, 'submitting', ['pending']);
+            sinon.assert.calledOnceWithExactly(
+                recoveryStatusLock,
+                sinon.match.any,
+                pendingPartial.id,
+                'submitting',
+                ['pending'],
+                {
+                    error: null,
+                    partial_resume_enqueue_claim: PARTIAL_RESUME_ENQUEUE_CLAIM
+                },
+                {
+                    expectedPartialResume: true,
+                    expectedPartialResumeEnqueueClaim: null
+                }
+            );
             sinon.assert.notCalled(scheduleEmail);
+        });
+
+        it('does not reselect a legacy submitting email created after this service started', async function () {
+            const serviceStart = Date.now();
+            const activeEmail = createModel({
+                id: 'legacy-current-service-claim',
+                status: 'submitting',
+                created_at: new Date(serviceStart + 1),
+                post: createModel({status: 'published'})
+            });
+            const recoveryStatusLock = sinon.stub().resolves(createModel({}));
+            const findAll = async ({filter}) => {
+                if (filter.includes('partial_resume:true') || filter.includes('created_at:<')) {
+                    return {models: []};
+                }
+                return {models: [activeEmail]};
+            };
+            const localService = new EmailService({
+                emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
+                limitService: {isLimited: () => false, errorIfIsOverLimit: () => {}, errorIfWouldGoOverLimit: () => {}},
+                verificationTrigger: {checkVerificationRequired: () => Promise.resolve(false)},
+                models: {Email: {findAll}},
+                batchSendingService: {scheduleEmail, updateStatusLock: recoveryStatusLock},
+                settingsCache,
+                emailRenderer,
+                membersRepository,
+                sendingService,
+                emailAnalyticsJobs: {scheduleRecurringNewslettersJob},
+                domainWarmingService,
+                resumeScannerServiceStart: serviceStart
+            });
+
+            await localService.resumeInterruptedSends();
+
+            sinon.assert.notCalled(recoveryStatusLock);
+            sinon.assert.notCalled(scheduleEmail);
+        });
+
+        it('fails legacy submitting rows with missing or malformed created_at without logging errors', async function () {
+            const corruptedEmails = [
+                createModel({
+                    id: 'legacy-null-created-at',
+                    status: 'submitting',
+                    created_at: null,
+                    post: createModel({status: 'published'})
+                }),
+                createModel({
+                    id: 'legacy-malformed-created-at',
+                    status: 'submitting',
+                    created_at: 'not-a-date',
+                    post: createModel({status: 'published'})
+                })
+            ];
+            const recoveryStatusLock = sinon.stub().resolves(createModel({}));
+            const errorLog = sinon.stub(logging, 'error');
+            const findAll = async ({filter}) => {
+                if (filter.includes('partial_resume:true') || filter.includes('created_at:')) {
+                    return {models: []};
+                }
+                return {models: corruptedEmails};
+            };
+            const localService = new EmailService({
+                emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
+                limitService: {isLimited: () => false, errorIfIsOverLimit: () => {}, errorIfWouldGoOverLimit: () => {}},
+                verificationTrigger: {checkVerificationRequired: () => Promise.resolve(false)},
+                models: {Email: {findAll}},
+                batchSendingService: {scheduleEmail, updateStatusLock: recoveryStatusLock},
+                settingsCache,
+                emailRenderer,
+                membersRepository,
+                sendingService,
+                emailAnalyticsJobs: {scheduleRecurringNewslettersJob},
+                domainWarmingService
+            });
+
+            await localService.resumeInterruptedSends();
+
+            assert.equal(recoveryStatusLock.callCount, 2);
+            corruptedEmails.forEach((email) => {
+                sinon.assert.calledWith(recoveryStatusLock, sinon.match.any, email.id, 'failed', ['submitting']);
+            });
+            sinon.assert.notCalled(scheduleEmail);
+            sinon.assert.notCalled(errorLog);
         });
 
         it('does not reselect a partial continuation claimed after this service started', async function () {
@@ -869,16 +1740,77 @@ describe('Email Service', function () {
             sinon.assert.notCalled(scheduleEmail);
         });
 
+        it('fails stale partial continuations while atomically clearing their expired worker claim', async function () {
+            const serviceStart = Date.now();
+            const stalePartial = createModel({
+                id: 'expired-partial-worker-claim',
+                status: 'submitting',
+                partial_resume: true,
+                partial_resume_enqueue_claim: PARTIAL_RESUME_ENQUEUE_CLAIM,
+                created_at: new Date(serviceStart - 2 * 24 * 60 * 60 * 1000),
+                updated_at: new Date(serviceStart - 2 * 24 * 60 * 60 * 1000),
+                post: createModel({status: 'published'})
+            });
+            const recoveryStatusLock = sinon.stub().resolves(createModel({}));
+            const findAll = async ({filter}) => {
+                if (filter.includes('partial_resume:true')) {
+                    return {models: [stalePartial]};
+                }
+                return {models: []};
+            };
+            const localService = new EmailService({
+                emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
+                limitService: {isLimited: () => false, errorIfIsOverLimit: () => {}, errorIfWouldGoOverLimit: () => {}},
+                verificationTrigger: {checkVerificationRequired: () => Promise.resolve(false)},
+                models: {Email: {findAll}},
+                batchSendingService: {scheduleEmail, updateStatusLock: recoveryStatusLock},
+                settingsCache,
+                emailRenderer,
+                membersRepository,
+                sendingService,
+                emailAnalyticsJobs: {scheduleRecurringNewslettersJob},
+                domainWarmingService,
+                resumeScannerServiceStart: serviceStart
+            });
+
+            await localService.resumeInterruptedSends();
+
+            sinon.assert.calledOnceWithExactly(
+                recoveryStatusLock,
+                sinon.match.any,
+                stalePartial.id,
+                'failed',
+                ['pending', 'submitting'],
+                {partial_resume_enqueue_claim: null},
+                {expectedPartialResume: true}
+            );
+            sinon.assert.notCalled(scheduleEmail);
+        });
+
         it('resumes a submitting partial continuation through its updated state timestamp', async function () {
             const overlap = createModel({
                 id: 'overlap-partial',
                 status: 'submitting',
                 partial_resume: true,
+                partial_resume_enqueue_claim: null,
                 created_at: new Date(),
                 updated_at: new Date(),
                 post: createModel({status: 'published'})
             });
-            const recoveryStatusLock = sinon.stub().resolves(createModel({status: 'pending'}));
+            const lockedOverlap = createModel({
+                id: overlap.id,
+                status: 'pending',
+                partial_resume: true,
+                post: createModel({status: 'published'})
+            });
+            const claimedOverlap = createModel({
+                id: overlap.id,
+                status: 'submitting',
+                partial_resume: true
+            });
+            const recoveryStatusLock = sinon.stub();
+            recoveryStatusLock.onFirstCall().resolves(lockedOverlap);
+            recoveryStatusLock.onSecondCall().resolves(claimedOverlap);
             const findAll = async ({filter}) => {
                 if (filter.includes('partial_resume:true')) {
                     return {models: [overlap]};
@@ -902,7 +1834,113 @@ describe('Email Service', function () {
 
             await localService.resumeInterruptedSends();
 
-            sinon.assert.calledOnceWithExactly(scheduleEmail, overlap);
+            sinon.assert.calledOnceWithExactly(scheduleEmail, claimedOverlap, {
+                partialResumeClaimed: true,
+                partialResumeClaim: sinon.match.string
+            });
+        });
+
+        it('does not emit raw email or post identifiers when recovering a partial continuation', async function () {
+            const serviceStart = Date.now();
+            const continuation = createModel({
+                id: 'raw-email-id',
+                post_id: 'raw-post-id',
+                status: 'submitting',
+                partial_resume: true,
+                error: null,
+                created_at: new Date(serviceStart - 2000),
+                updated_at: new Date(serviceStart - 1000),
+                post: createModel({status: 'published'})
+            });
+            const lockedContinuation = createModel({
+                id: continuation.id,
+                post_id: continuation.get('post_id'),
+                status: 'pending',
+                partial_resume: true,
+                error: null
+            });
+            const recoveryStatusLock = sinon.stub().resolves(lockedContinuation);
+            const infoLog = sinon.stub(logging, 'info');
+            const warnLog = sinon.stub(logging, 'warn');
+            const errorLog = sinon.stub(logging, 'error');
+            const findAll = async ({filter}) => {
+                if (filter.includes('partial_resume:true')) {
+                    return {models: [continuation]};
+                }
+                return {models: [continuation]};
+            };
+            const localService = new EmailService({
+                emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
+                limitService: {isLimited: () => false, errorIfIsOverLimit: () => {}, errorIfWouldGoOverLimit: () => {}},
+                verificationTrigger: {checkVerificationRequired: () => Promise.resolve(false)},
+                models: {Email: {findAll}},
+                batchSendingService: {scheduleEmail, updateStatusLock: recoveryStatusLock},
+                settingsCache,
+                emailRenderer,
+                membersRepository,
+                sendingService,
+                emailAnalyticsJobs: {scheduleRecurringNewslettersJob},
+                domainWarmingService,
+                resumeScannerServiceStart: serviceStart
+            });
+
+            await localService.resumeInterruptedSends();
+
+            const logged = [infoLog, warnLog, errorLog]
+                .flatMap(log => log.getCalls())
+                .flatMap(call => call.args)
+                .map(value => value instanceof Error ? `${value.name}: ${value.message}` : String(value))
+                .join('\n');
+            assert.doesNotMatch(logged, /raw-email-id|raw-post-id/);
+        });
+
+        it('does not emit raw identifiers or exception text when partial recovery lookup fails', async function () {
+            const serviceStart = Date.now();
+            const continuation = createModel({
+                id: 'raw-email-id',
+                post_id: 'raw-post-id',
+                status: 'pending',
+                partial_resume: true,
+                error: null,
+                created_at: new Date(serviceStart - 2000),
+                updated_at: new Date(serviceStart - 1000)
+            });
+            continuation.getLazyRelation = () => {
+                throw new Error('raw-recipient@example.test raw-email-id');
+            };
+            const recoveryStatusLock = sinon.stub().resolves(createModel({}));
+            const infoLog = sinon.stub(logging, 'info');
+            const warnLog = sinon.stub(logging, 'warn');
+            const errorLog = sinon.stub(logging, 'error');
+            const findAll = async ({filter}) => {
+                if (filter.includes('partial_resume:true')) {
+                    return {models: [continuation]};
+                }
+                return {models: []};
+            };
+            const localService = new EmailService({
+                emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
+                limitService: {isLimited: () => false, errorIfIsOverLimit: () => {}, errorIfWouldGoOverLimit: () => {}},
+                verificationTrigger: {checkVerificationRequired: () => Promise.resolve(false)},
+                models: {Email: {findAll}},
+                batchSendingService: {scheduleEmail, updateStatusLock: recoveryStatusLock},
+                settingsCache,
+                emailRenderer,
+                membersRepository,
+                sendingService,
+                emailAnalyticsJobs: {scheduleRecurringNewslettersJob},
+                domainWarmingService,
+                resumeScannerServiceStart: serviceStart
+            });
+
+            await localService.resumeInterruptedSends();
+
+            const logged = [infoLog, warnLog, errorLog]
+                .flatMap(log => log.getCalls())
+                .flatMap(call => call.args)
+                .map(value => value instanceof Error ? `${value.name}: ${value.message}` : String(value))
+                .join('\n');
+            assert.doesNotMatch(logged, /raw-email-id|raw-post-id|raw-recipient@example\.test/);
         });
 
         it('Marks email as failed if the parent post is no longer published or sent', async function () {
@@ -943,8 +1981,8 @@ describe('Email Service', function () {
 
         it('Flips stale submitting emails to failed and does not resume them', async function () {
             const recoveryStatusLock = sinon.stub().resolves(createModel({}));
-            // One ancient stale row, one fresh row. The mock differentiates by the filter
-            // string the scanner uses: `created_at:<` for stale, `created_at:>` for fresh.
+            // One ancient stale row and one fresh row. The scanner receives all legacy
+            // submitting rows and classifies them locally against its fixed start time.
             const staleEmail = createModel({
                 id: 'ancient',
                 status: 'submitting',
@@ -968,10 +2006,7 @@ describe('Email Service', function () {
                             if (filter.includes('partial_resume:true')) {
                                 return {models: []};
                             }
-                            if (filter.includes('created_at:<')) {
-                                return {models: [staleEmail]};
-                            }
-                            return {models: [freshEmail]};
+                            return {models: [staleEmail, freshEmail]};
                         }
                     }
                 },
@@ -999,8 +2034,21 @@ describe('Email Service', function () {
         });
 
         it('Respects bulkEmail:resumeMaxAgeMs config override', async function () {
+            const serviceStart = Date.now();
             const recoveryStatusLock = sinon.stub().resolves(createModel({}));
             const capturedFilters = [];
+            const staleEmail = createModel({
+                id: 'config-stale',
+                status: 'submitting',
+                created_at: new Date(serviceStart - 61 * 60 * 1000),
+                post: createModel({status: 'published'})
+            });
+            const freshEmail = createModel({
+                id: 'config-fresh',
+                status: 'submitting',
+                created_at: new Date(serviceStart - 59 * 60 * 1000),
+                post: createModel({status: 'published'})
+            });
 
             const localService = new EmailService({
                 emailSegmenter: {getMembersCount: () => Promise.resolve(0)},
@@ -1010,7 +2058,10 @@ describe('Email Service', function () {
                     Email: {
                         findAll: async ({filter}) => {
                             capturedFilters.push(filter);
-                            return {models: []};
+                            if (filter.includes('partial_resume:true')) {
+                                return {models: []};
+                            }
+                            return {models: [staleEmail, freshEmail]};
                         }
                     }
                 },
@@ -1021,27 +2072,19 @@ describe('Email Service', function () {
                 sendingService,
                 emailAnalyticsJobs: {scheduleRecurringNewslettersJob},
                 domainWarmingService,
-                // 1 hour override
-                config: {get: key => (key === 'bulkEmail:resumeMaxAgeMs' ? 60 * 60 * 1000 : undefined)}
+                config: {get: key => (key === 'bulkEmail:resumeMaxAgeMs' ? 60 * 60 * 1000 : undefined)},
+                resumeScannerServiceStart: serviceStart
             });
 
-            const before = Date.now();
             await localService.resumeInterruptedSends();
-            const after = Date.now();
 
-            assert.equal(capturedFilters.length, 3);
-            // Legacy scans carry the same cutoff timestamp. Explicit partial
-            // continuations are classified locally from their persisted updated_at.
-            const timeFilters = capturedFilters.filter(filter => filter.includes('created_at:'));
-            assert.equal(timeFilters.length, 2);
-            const match = timeFilters[0].match(/created_at:[<>]'([^']+)'/);
-            assert.ok(match, `expected ISO cutoff in filter, got: ${capturedFilters[0]}`);
-            assert.ok(timeFilters.every(filter => filter.includes(`'${match[1]}'`)), 'legacy state scans must use the same cutoff');
-            assert.ok(capturedFilters.some(filter => filter === 'status:[pending,submitting]+partial_resume:true'), 'partial continuation scan must select explicit marked states');
-            const cutoffMs = new Date(match[1]).getTime();
-            // Cutoff should be ~1 hour before "now" (the moment we called resumeInterruptedSends).
-            assert.ok(cutoffMs >= before - 60 * 60 * 1000 - 100, `cutoff ${match[1]} too old`);
-            assert.ok(cutoffMs <= after - 60 * 60 * 1000 + 100, `cutoff ${match[1]} too recent`);
+            assert.deepEqual(capturedFilters, [
+                'status:submitting',
+                'status:[pending,submitting]+partial_resume:true'
+            ]);
+            sinon.assert.calledWith(recoveryStatusLock, sinon.match.any, staleEmail.id, 'failed', ['submitting']);
+            sinon.assert.calledWith(recoveryStatusLock, sinon.match.any, freshEmail.id, 'pending', ['submitting']);
+            sinon.assert.calledOnce(scheduleEmail);
         });
     });
 

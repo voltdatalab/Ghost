@@ -1,5 +1,6 @@
 const sinon = require('sinon');
 const assert = require('node:assert/strict');
+const logging = require('@tryghost/logging');
 
 const SendingService = require('../../../../../core/server/services/email-service/sending-service');
 
@@ -34,9 +35,7 @@ describe('Sending service', function () {
                 }),
                 getSubject: sinon.stub().returns('Hi'),
                 getFromAddress: sinon.stub().returns('ghost@example.com'),
-                getReplyToAddress: () => {
-                    return replyTo;
-                }
+                getReplyToAddress: sinon.stub().callsFake(() => replyTo)
             };
 
             emailProvider = {
@@ -113,6 +112,68 @@ describe('Sending service', function () {
             );
             // Verify domain is not included when useFallbackAddress is not set
             assert.equal(sendStub.getCall(0).args[0].domain, undefined);
+        });
+
+        it('does not log an invalid recipient address', async function () {
+            const sendingService = new SendingService({
+                emailRenderer,
+                emailProvider,
+                emailAddressService
+            });
+            const warning = sinon.stub(logging, 'warn');
+            const invalidEmail = 'invalid recipient@example.test';
+
+            await sendingService.send({
+                post: {},
+                newsletter: {},
+                segment: null,
+                emailId: '123',
+                members: [{email: invalidEmail, name: 'John'}]
+            }, {
+                clickTrackingEnabled: true,
+                openTrackingEnabled: true
+            });
+
+            sinon.assert.calledOnce(warning);
+            assert.doesNotMatch(String(warning.firstCall.args[0]), new RegExp(invalidEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+        });
+
+        it('uses explicit persisted headers without calling the header renderer', async function () {
+            const sendingService = new SendingService({
+                emailRenderer,
+                emailProvider,
+                emailAddressService
+            });
+
+            await sendingService.send({
+                post: {},
+                newsletter: {},
+                segment: null,
+                emailId: '123',
+                emailSnapshot: {
+                    subject: 'Persisted subject',
+                    from: 'persisted@example.test',
+                    replyTo: 'reply@example.test'
+                },
+                members: [
+                    {
+                        email: 'member@example.com',
+                        name: 'John'
+                    }
+                ]
+            }, {
+                clickTrackingEnabled: true,
+                openTrackingEnabled: true
+            });
+
+            sinon.assert.notCalled(emailRenderer.getSubject);
+            sinon.assert.notCalled(emailRenderer.getFromAddress);
+            sinon.assert.notCalled(emailRenderer.getReplyToAddress);
+            sinon.assert.calledWithMatch(sendStub, {
+                subject: 'Persisted subject',
+                from: 'persisted@example.test',
+                replyTo: 'reply@example.test'
+            });
         });
 
         it('calls mailgun client without the deliverytime if it is not defined', async function () {

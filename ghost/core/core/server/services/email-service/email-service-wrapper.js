@@ -130,6 +130,7 @@ class EmailServiceWrapper {
             emailRenderer,
             domainWarmingService,
             db,
+            config: configService,
             sentry,
             getRequiredUrlRelations,
             debugStorageFilePath: configService.getContentPath('data')
@@ -156,7 +157,8 @@ class EmailServiceWrapper {
             verificationTrigger: membersService.verificationTrigger,
             emailAnalyticsJobs,
             domainWarmingService,
-            config: configService
+            config: configService,
+            db
         });
 
         this.controller = new EmailController(this.service, {

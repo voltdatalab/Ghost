@@ -92,6 +92,24 @@ const controller = {
         }
     },
 
+    legacyPartialResumeProof: {
+        headers: {
+            cacheInvalidate: false
+        },
+        data: [
+            'id',
+            'proof',
+            'signature'
+        ],
+        options: [],
+        permissions: {
+            method: 'retry'
+        },
+        async query(frame) {
+            return await emailService.controller.admitLegacyPartialResumeProof(frame);
+        }
+    },
+
     browseBatches: {
         headers: {
             cacheInvalidate: false

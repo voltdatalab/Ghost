@@ -5,12 +5,102 @@ const assert = require('node:assert/strict');
 const logging = require('@tryghost/logging');
 const nql = require('@tryghost/nql');
 const errors = require('@tryghost/errors');
+const crypto = require('node:crypto');
+const {canonicalizeLegacyProofPayload, hashStringList} = require('../../../../../core/server/services/email-service/legacy-partial-resume-proof');
 
 // We need a short sleep in some tests to simulate time passing
 // This way we don't actually add a delay to the tests
 const simulateSleep = async (ms, clock) => {
     await Promise.all([sleep(ms), clock.tickAsync(ms)]);
 };
+
+const LEGACY_PROOF_PUBLIC_KEY_CONFIG = 'bulkEmail:partialResume:legacyProxyPublicKey';
+const LEGACY_EMAIL_ID = '64b000000000000000000001';
+const LEGACY_BATCH_IDS = ['64b000000000000000000002', '64b000000000000000000003'];
+const LEGACY_MEMBER_IDS = ['64b000000000000000000010', '64b000000000000000000011'];
+const LEGACY_MEMBER_EMAILS = ['first@example.test', 'second@example.test'];
+const PARTIAL_RESUME_ENQUEUE_CLAIM = '00000000-0000-4000-8000-000000000001';
+const LEGACY_PROOF_KEY_PAIR = crypto.generateKeyPairSync('ed25519');
+
+function createStoredLegacyProof() {
+    const issuedAt = new Date(Date.now() - 1000);
+    const proxyCreatedAt = new Date(Date.now() - 2000);
+    const proof = {
+        version: 1,
+        transport: 'ses-proxy-mailgun-v1',
+        email_id: LEGACY_EMAIL_ID,
+        issued_at: issuedAt.toISOString(),
+        legacy_batch_ids: LEGACY_BATCH_IDS,
+        legacy_provider_id_mode: 'email-id',
+        ledger_member_count: LEGACY_MEMBER_IDS.length,
+        ledger_member_hash: hashStringList(LEGACY_MEMBER_IDS),
+        ledger_email_count: LEGACY_MEMBER_EMAILS.length,
+        ledger_email_hash: hashStringList(LEGACY_MEMBER_EMAILS),
+        ledger_binding_hash: hashStringList(LEGACY_BATCH_IDS.map((batchId, index) => `${batchId}\u0000${LEGACY_MEMBER_IDS[index]}\u0000${LEGACY_MEMBER_EMAILS[index]}`)),
+        proxy_input_count: LEGACY_MEMBER_EMAILS.length,
+        proxy_input_hash: hashStringList(LEGACY_MEMBER_EMAILS),
+        proxy_sent_count: LEGACY_MEMBER_EMAILS.length,
+        proxy_sent_hash: hashStringList(LEGACY_MEMBER_EMAILS),
+        proxy_site_count: 1,
+        proxy_batch_count: LEGACY_BATCH_IDS.length,
+        proxy_first_created_at: proxyCreatedAt.toISOString(),
+        proxy_last_created_at: proxyCreatedAt.toISOString()
+    };
+    const {payloadJson} = canonicalizeLegacyProofPayload(proof);
+    const publicKey = LEGACY_PROOF_KEY_PAIR.publicKey.export({type: 'spki', format: 'pem'});
+    const signature = crypto.sign(null, Buffer.from(payloadJson, 'utf8'), LEGACY_PROOF_KEY_PAIR.privateKey).toString('base64url');
+    const signingKeyFingerprint = crypto.createHash('sha256').update(crypto.createPublicKey(publicKey).export({type: 'spki', format: 'der'})).digest('hex');
+
+    return {
+        publicKey,
+        row: {
+            id: '64b000000000000000000099',
+            email_id: LEGACY_EMAIL_ID,
+            proof_payload: payloadJson,
+            proof_hash: crypto.createHash('sha256').update(payloadJson, 'utf8').digest('hex'),
+            signature,
+            signing_key_fingerprint: signingKeyFingerprint,
+            transport: proof.transport
+        }
+    };
+}
+
+function createLegacyProofDb({proof, recipients}) {
+    return {
+        knex(table) {
+            const query = {
+                select() {
+                    return query;
+                },
+                where() {
+                    return query;
+                },
+                then(resolve, reject) {
+                    const rows = table === 'email_partial_resume_proofs'
+                        ? (proof ? [proof] : [])
+                        : (table === 'email_recipients' ? recipients : []);
+                    return Promise.resolve(rows).then(resolve, reject);
+                }
+            };
+            return query;
+        }
+    };
+}
+
+function createCloneablePost(properties) {
+    const postProperties = {...properties};
+    const post = createModel(postProperties);
+    post.clone = () => {
+        const snapshotProperties = {...postProperties};
+        const snapshot = createModel(snapshotProperties);
+        snapshot.set = (values) => {
+            Object.assign(snapshotProperties, values);
+            return snapshot;
+        };
+        return snapshot;
+    };
+    return post;
+}
 
 describe('Batch Sending Service', function () {
     let errorLog;
@@ -64,7 +154,7 @@ describe('Batch Sending Service', function () {
             const result = await service.emailJob({emailId: '123'});
             assert.equal(result, undefined);
             sinon.assert.calledOnce(errorLog);
-            sinon.assert.calledWith(errorLog, 'Tried sending email that is not pending or failed 123');
+            sinon.assert.calledWith(errorLog, 'Tried sending email that is not pending 123');
         });
 
         it('does not send if already submitted', async function () {
@@ -79,7 +169,227 @@ describe('Batch Sending Service', function () {
             const result = await service.emailJob({emailId: '123'});
             assert.equal(result, undefined);
             sinon.assert.calledOnce(errorLog);
-            sinon.assert.calledWith(errorLog, 'Tried sending email that is not pending or failed 123');
+            sinon.assert.calledWith(errorLog, 'Tried sending email that is not pending 123');
+        });
+
+        it('does not dispatch a delayed normal job after enqueue compensation marked it failed', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'failed',
+                partial_resume: false
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const sendEmail = sinon.stub(service, 'sendEmail').resolves();
+
+            await service.emailJob({emailId: email.id});
+
+            sinon.assert.notCalled(sendEmail);
+            assert.equal(email.get('status'), 'failed');
+        });
+
+        it('does not dispatch an ambiguously queued strict partial job after recovery marked it failed', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'failed',
+                partial_resume: true
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const sendPartialEmail = sinon.stub(service, 'sendPartialEmail').resolves();
+
+            await service.emailJob({emailId: email.id, partialResume: true});
+
+            sinon.assert.notCalled(sendPartialEmail);
+            assert.equal(email.get('status'), 'failed');
+        });
+
+        it('does not let a strict partial job claim a non-partial email', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'pending',
+                partial_resume: false
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const sendEmail = sinon.stub(service, 'sendEmail').resolves();
+            const sendPartialEmail = sinon.stub(service, 'sendPartialEmail').resolves();
+
+            await service.emailJob({emailId: email.id, partialResume: true});
+
+            sinon.assert.notCalled(sendEmail);
+            sinon.assert.notCalled(sendPartialEmail);
+            assert.equal(email.get('status'), 'pending');
+        });
+
+        it('marks a strict partial continuation in the scheduled job data', async function () {
+            const jobsService = {
+                addJob: sinon.stub().resolves()
+            };
+            const email = createModel({id: 'partial-email'});
+            const service = new BatchSendingService({jobsService});
+
+            await service.scheduleEmail(email, {partialResume: true});
+
+            assert.deepEqual(jobsService.addJob.firstCall.args[0].data, {
+                emailId: email.id,
+                partialResume: true,
+                partialResumeClaimed: false
+            });
+        });
+
+        it('dispatches a pending strict partial job through the partial sender', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'pending',
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: null
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const sendEmail = sinon.stub(service, 'sendEmail').resolves();
+            const sendPartialEmail = sinon.stub(service, 'sendPartialEmail').resolves();
+
+            await service.emailJob({emailId: email.id, partialResume: true});
+
+            sinon.assert.notCalled(sendEmail);
+            sinon.assert.calledOnceWithExactly(sendPartialEmail, email);
+            assert.equal(email.get('status'), 'submitted');
+            assert.equal(email.get('partial_resume'), false);
+        });
+
+        it('does not let an unclaimed strict partial job adopt a recovery marker', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'pending',
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: PARTIAL_RESUME_ENQUEUE_CLAIM
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const sendPartialEmail = sinon.stub(service, 'sendPartialEmail').resolves();
+
+            await service.emailJob({emailId: email.id, partialResume: true});
+
+            sinon.assert.notCalled(sendPartialEmail);
+            assert.equal(email.get('status'), 'pending');
+            assert.equal(email.get('error'), null);
+            assert.equal(email.get('partial_resume_enqueue_claim'), PARTIAL_RESUME_ENQUEUE_CLAIM);
+        });
+
+        it('allows only the claimed job to clear and dispatch a durable recovery marker', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'submitting',
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: PARTIAL_RESUME_ENQUEUE_CLAIM
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const sendPartialEmail = sinon.stub(service, 'sendPartialEmail').resolves();
+
+            await service.emailJob({
+                emailId: email.id,
+                partialResumeClaimed: true,
+                partialResumeClaim: PARTIAL_RESUME_ENQUEUE_CLAIM
+            });
+
+            sinon.assert.calledOnceWithExactly(sendPartialEmail, email);
+            assert.equal(email.get('status'), 'submitted');
+            assert.equal(email.get('error'), null);
+            assert.equal(email.get('partial_resume_enqueue_claim'), null);
+        });
+
+        it('does not let an old claimed-job payload adopt a newer durable recovery marker', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'submitting',
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: PARTIAL_RESUME_ENQUEUE_CLAIM
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const sendPartialEmail = sinon.stub(service, 'sendPartialEmail').resolves();
+
+            await service.emailJob({emailId: email.id, partialResumeClaimed: true});
+
+            sinon.assert.notCalled(sendPartialEmail);
+            assert.equal(email.get('status'), 'submitting');
+            assert.equal(email.get('error'), null);
+            assert.equal(email.get('partial_resume_enqueue_claim'), PARTIAL_RESUME_ENQUEUE_CLAIM);
+        });
+
+        it('keeps pre-token claimed-job payloads compatible only with the pre-token state', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'submitting',
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: null
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const sendPartialEmail = sinon.stub(service, 'sendPartialEmail').resolves();
+
+            await service.emailJob({emailId: email.id, partialResumeClaimed: true});
+
+            sinon.assert.calledOnceWithExactly(sendPartialEmail, email);
+            assert.equal(email.get('status'), 'submitted');
+            assert.equal(email.get('partial_resume_enqueue_claim'), null);
+        });
+
+        it('does not let a claimed job with a mismatched token adopt a newer generation', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'submitting',
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: '00000000-0000-4000-8000-000000000002'
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const sendPartialEmail = sinon.stub(service, 'sendPartialEmail').resolves();
+
+            await service.emailJob({
+                emailId: email.id,
+                partialResumeClaimed: true,
+                partialResumeClaim: PARTIAL_RESUME_ENQUEUE_CLAIM
+            });
+
+            sinon.assert.notCalled(sendPartialEmail);
+            assert.equal(email.get('status'), 'submitting');
+            assert.equal(email.get('partial_resume_enqueue_claim'), '00000000-0000-4000-8000-000000000002');
         });
 
         it('does send email if pending', async function () {
@@ -214,6 +524,66 @@ describe('Batch Sending Service', function () {
             assert.equal(emailModel.status, 'submitting', 'The email status is submitting while sending');
             assert.equal(afterEmailModel.get('status'), 'failed', 'The email status is failed after sending');
             assert.equal(afterEmailModel.get('error'), 'Something went wrong while sending the email');
+        });
+
+        it('releases the exact partial worker claim on orderly shutdown so boot recovery can resume it', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'pending',
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: null
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            const shutdown = new Error('shutdown');
+            shutdown.code = BatchSendingService.SHUTDOWN_CODE;
+            sinon.stub(service, 'sendPartialEmail').rejects(shutdown);
+
+            await service.emailJob({emailId: email.id, partialResume: true});
+
+            assert.equal(email.get('status'), 'submitting');
+            assert.equal(email.get('error'), null);
+            assert.equal(email.get('partial_resume_enqueue_claim'), null);
+        });
+
+        it('does not let a late partial worker overwrite the scanner fail-closed state', async function () {
+            const email = createModel({
+                id: '123',
+                status: 'pending',
+                partial_resume: true,
+                error: null,
+                partial_resume_enqueue_claim: null
+            });
+            const Email = {
+                transaction: async callback => await callback(),
+                findOne: async () => email
+            };
+            const service = new BatchSendingService({models: {Email}});
+            let finishSend;
+            const sending = new Promise(resolve => {
+                finishSend = resolve;
+            });
+            const sendPartialEmail = sinon.stub(service, 'sendPartialEmail').returns(sending);
+
+            const job = service.emailJob({emailId: email.id, partialResume: true});
+            await new Promise((resolve) => {
+                setImmediate(resolve);
+            });
+            sinon.assert.calledOnce(sendPartialEmail);
+            await email.save({
+                status: 'failed',
+                partial_resume_enqueue_claim: null
+            }, {patch: true});
+            finishSend();
+            await job;
+
+            assert.equal(email.get('status'), 'failed');
+            assert.equal(email.get('partial_resume'), true);
+            assert.equal(email.get('partial_resume_enqueue_claim'), null);
         });
     });
 
@@ -819,6 +1189,9 @@ describe('Batch Sending Service', function () {
     describe('createBatch', function () {
         it('does not create if rows missing data', async function () {
             const EmailBatch = createModelClass({});
+            const warning = sinon.stub(logging, 'warn');
+            const rawMemberId = 'sensitive-member-id';
+            const rawEmail = 'sensitive@example.test';
 
             const db = createDb({});
             const insert = sinon.spy(db, 'insert');
@@ -833,7 +1206,10 @@ describe('Batch Sending Service', function () {
                 post: createModel({})
             });
             const members = [
-                createModel({}).toJSON(), // <= is missing uuid and email,
+                createModel({
+                    id: rawMemberId,
+                    email: rawEmail
+                }).toJSON(), // missing uuid
                 createModel({
                     email: `example1@example.com`,
                     uuid: `member1`
@@ -846,6 +1222,10 @@ describe('Batch Sending Service', function () {
 
             const insertedRecipients = calls.flatMap(call => call.args[0]);
             assert.equal(insertedRecipients.length, 1);
+            sinon.assert.calledOnce(warning);
+            const warningMessage = String(warning.firstCall.args[0]);
+            assert.equal(warningMessage.includes(rawMemberId), false);
+            assert.equal(warningMessage.includes(rawEmail), false);
         });
     });
 
@@ -2200,6 +2580,629 @@ describe('Batch Sending Service', function () {
             assert.equal(afterEmailModel.get('error'), undefined, 'No error field should be written when send stops on shutdown');
             // logging.info was stubbed in the outer beforeEach — confirm the shutdown breadcrumb was emitted.
             sinon.assert.calledWithMatch(logging.info, /send stopped because the container is shutting down/);
+        });
+    });
+
+    describe('legacy partial-resume proof and render snapshot', function () {
+        it('admits only a verified legacy prefix and snapshots the persisted lexical source in memory', async function () {
+            const {publicKey, row: proof} = createStoredLegacyProof();
+            const recipients = [
+                {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[0]},
+                {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[1]}
+            ];
+            const postMeta = createModel({email_subject: 'Original email subject'});
+            const post = createCloneablePost({
+                status: 'published',
+                title: 'Live title',
+                lexical: 'live lexical must not be rendered',
+                mobiledoc: 'live mobiledoc must not be rendered',
+                posts_meta: postMeta,
+                loaded: ['posts_meta']
+            });
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                status: 'submitted',
+                partial_resume: false,
+                source: 'persisted lexical source',
+                source_type: 'lexical',
+                subject: 'Live title',
+                from: 'persisted@example.test',
+                reply_to: 'reply@example.test',
+                post,
+                newsletter
+            });
+            const EmailBatch = createModelClass({
+                findAll: LEGACY_BATCH_IDS.map(id => ({
+                    id,
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: LEGACY_EMAIL_ID,
+                    recipient_count: null,
+                    recipient_hash: null
+                }))
+            });
+            const emailRenderer = {
+                getSegments: sinon.stub().resolves([null]),
+                getSubject: sinon.stub().returns('Live title'),
+                getFromAddress: sinon.stub().returns('persisted@example.test'),
+                getReplyToAddress: sinon.stub().returns('reply@example.test'),
+                renderBody: sinon.stub().callsFake(async renderedPost => ({
+                    html: `html:${renderedPost.get('lexical')}`,
+                    plaintext: `text:${renderedPost.get('lexical')}`,
+                    replacements: [{id: 'member-name'}]
+                }))
+            };
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({proof, recipients}),
+                config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined},
+                emailRenderer
+            });
+            const getMissingRecipientCount = sinon.stub(service, 'getMissingRecipientCount').resolves(1);
+
+            const result = await service.assertCanStartPartialResume(email);
+
+            assert.equal(result.missingRecipientCount, 1);
+            assert.match(result.renderHash, /^[a-f0-9]{64}$/);
+            const snapshot = getMissingRecipientCount.firstCall.args[0].post;
+            assert.notEqual(snapshot, post);
+            assert.equal(snapshot.get('lexical'), 'persisted lexical source');
+            assert.equal(snapshot.get('mobiledoc'), null);
+            assert.equal(post.get('lexical'), 'live lexical must not be rendered');
+            assert.equal(post.get('mobiledoc'), 'live mobiledoc must not be rendered');
+            sinon.assert.calledWith(emailRenderer.getSegments, snapshot);
+            sinon.assert.calledWith(emailRenderer.renderBody, snapshot, newsletter, null, {clickTrackingEnabled: false});
+
+            await email.save({partial_resume: true, partial_resume_render_hash: result.renderHash});
+            const recoveryResult = await service.assertCanStartPartialResume(email);
+            assert.equal(recoveryResult.renderHash, result.renderHash);
+
+            await email.save({track_clicks: true});
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            await email.save({track_clicks: undefined});
+
+            await email.save({source: 'changed persisted lexical source'});
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            await email.save({source: 'persisted lexical source'});
+
+            await email.save({source_type: 'mobiledoc'});
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            await email.save({source_type: 'lexical'});
+
+            await post.save({title: 'Changed title'});
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            await post.save({title: 'Live title'});
+
+            await postMeta.save({email_subject: 'Changed email subject'});
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            await postMeta.save({email_subject: 'Original email subject'});
+
+            emailRenderer.getSegments.resolves([null, 'members']);
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            emailRenderer.getSegments.resolves([null]);
+
+            await newsletter.save({background_color: 'dark'});
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+        });
+
+        it('snapshots persisted mobiledoc source without mutating the live post', async function () {
+            const {publicKey, row: proof} = createStoredLegacyProof();
+            const recipients = [
+                {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[0]},
+                {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[1]}
+            ];
+            const source = '{"version":"0.3.1","atoms":[],"cards":[],"markups":[],"sections":[]}';
+            const post = createCloneablePost({
+                status: 'published',
+                title: 'Live title',
+                lexical: 'live lexical must not be rendered',
+                mobiledoc: 'live mobiledoc must not be rendered',
+                loaded: []
+            });
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                partial_resume: false,
+                source,
+                source_type: 'mobiledoc',
+                subject: 'Live title',
+                from: 'persisted@example.test',
+                reply_to: 'reply@example.test',
+                post,
+                newsletter
+            });
+            const EmailBatch = createModelClass({
+                findAll: LEGACY_BATCH_IDS.map(id => ({
+                    id,
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: LEGACY_EMAIL_ID,
+                    recipient_count: null,
+                    recipient_hash: null
+                }))
+            });
+            const emailRenderer = {
+                getSegments: sinon.stub().resolves([null]),
+                getSubject: sinon.stub().returns('Live title'),
+                getFromAddress: sinon.stub().returns('persisted@example.test'),
+                getReplyToAddress: sinon.stub().returns('reply@example.test'),
+                renderBody: sinon.stub().callsFake(async renderedPost => ({
+                    html: `html:${renderedPost.get('mobiledoc')}`,
+                    plaintext: `text:${renderedPost.get('mobiledoc')}`,
+                    replacements: []
+                }))
+            };
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({proof, recipients}),
+                config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined},
+                emailRenderer
+            });
+            const getMissingRecipientCount = sinon.stub(service, 'getMissingRecipientCount').resolves(1);
+
+            await service.assertCanStartPartialResume(email);
+
+            const snapshot = getMissingRecipientCount.firstCall.args[0].post;
+            assert.equal(snapshot.get('lexical'), null);
+            assert.equal(snapshot.get('mobiledoc'), source);
+            assert.equal(post.get('lexical'), 'live lexical must not be rendered');
+            assert.equal(post.get('mobiledoc'), 'live mobiledoc must not be rendered');
+
+            for (const sourceType of [undefined, 'html']) {
+                await email.save({source_type: sourceType});
+                await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            }
+        });
+
+        it('rejects persisted headers that no longer match the live rendering contract', async function () {
+            const {publicKey, row: proof} = createStoredLegacyProof();
+            const recipients = [
+                {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[0]},
+                {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[1]}
+            ];
+            const post = createCloneablePost({status: 'published', title: 'Live title', loaded: []});
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                partial_resume: false,
+                source: 'persisted lexical source',
+                source_type: 'lexical',
+                subject: 'Live title',
+                from: 'persisted@example.test',
+                reply_to: 'reply@example.test',
+                post,
+                newsletter
+            });
+            const EmailBatch = createModelClass({
+                findAll: LEGACY_BATCH_IDS.map(id => ({
+                    id,
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: LEGACY_EMAIL_ID,
+                    recipient_count: null,
+                    recipient_hash: null
+                }))
+            });
+            const emailRenderer = {
+                getSegments: sinon.stub().resolves([null]),
+                getSubject: sinon.stub().returns('Live title'),
+                getFromAddress: sinon.stub().returns('changed@example.test'),
+                getReplyToAddress: sinon.stub().returns('reply@example.test'),
+                renderBody: sinon.stub().resolves({html: '<p>body</p>', plaintext: 'body', replacements: []})
+            };
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({proof, recipients}),
+                config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined},
+                emailRenderer
+            });
+            const getMissingRecipientCount = sinon.stub(service, 'getMissingRecipientCount');
+
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            sinon.assert.notCalled(getMissingRecipientCount);
+        });
+
+        it('rejects a manifest-backed signed legacy batch with an incompatible provider id', async function () {
+            const {publicKey, row: proof} = createStoredLegacyProof();
+            const recipients = [
+                {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[0]},
+                {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[1]}
+            ];
+            const post = createCloneablePost({status: 'published', title: 'Live title', loaded: []});
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                partial_resume: false,
+                source: 'persisted lexical source',
+                source_type: 'lexical',
+                subject: 'Live title',
+                from: 'persisted@example.test',
+                reply_to: 'reply@example.test',
+                post,
+                newsletter
+            });
+            const EmailBatch = createModelClass({
+                findAll: LEGACY_BATCH_IDS.map((id, index) => ({
+                    id,
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: index === 0 ? 'wrong-legacy-provider-id' : 'other-provider-id',
+                    recipient_count: 1,
+                    recipient_hash: crypto.createHash('sha256').update(JSON.stringify([LEGACY_MEMBER_IDS[index]])).digest('hex')
+                }))
+            });
+            const emailRenderer = {
+                getSegments: sinon.stub().resolves([null]),
+                getSubject: sinon.stub().returns('Live title'),
+                getFromAddress: sinon.stub().returns('persisted@example.test'),
+                getReplyToAddress: sinon.stub().returns('reply@example.test'),
+                renderBody: sinon.stub().resolves({html: '<p>body</p>', plaintext: 'body', replacements: []})
+            };
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({proof, recipients}),
+                config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined},
+                emailRenderer
+            });
+            const getMissingRecipientCount = sinon.stub(service, 'getMissingRecipientCount').resolves(1);
+
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            sinon.assert.notCalled(getMissingRecipientCount);
+        });
+
+        it('allows only signed null-manifest batches during recovery while verifying later native batches', async function () {
+            const {publicKey, row: proof} = createStoredLegacyProof();
+            const recipients = [
+                {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[0]},
+                {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[1]}
+            ];
+            const legacyRows = LEGACY_BATCH_IDS.map(id => ({
+                id,
+                email_id: LEGACY_EMAIL_ID,
+                status: 'submitted',
+                provider_id: LEGACY_EMAIL_ID,
+                recipient_count: null,
+                recipient_hash: null
+            }));
+            let batchRows = legacyRows;
+            const EmailBatch = {
+                findAll: async () => {
+                    return {models: batchRows.map(row => createModel(row))};
+                }
+            };
+            const post = createCloneablePost({status: 'published', title: 'Live title', loaded: []});
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                partial_resume: false,
+                source: 'persisted lexical source',
+                source_type: 'lexical',
+                subject: 'Live title',
+                from: 'persisted@example.test',
+                reply_to: 'reply@example.test',
+                post,
+                newsletter
+            });
+            const emailRenderer = {
+                getSegments: sinon.stub().resolves([null]),
+                getSubject: sinon.stub().returns('Live title'),
+                getFromAddress: sinon.stub().returns('persisted@example.test'),
+                getReplyToAddress: sinon.stub().returns('reply@example.test'),
+                renderBody: sinon.stub().resolves({html: '<p>body</p>', plaintext: 'body', replacements: []})
+            };
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({proof, recipients}),
+                config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined},
+                emailRenderer
+            });
+            sinon.stub(service, 'getMissingRecipientCount').resolves(1);
+
+            const first = await service.assertCanStartPartialResume(email);
+            await email.save({partial_resume: true, partial_resume_render_hash: first.renderHash});
+
+            const nativeMemberId = '64b64cfa12ecdd2d94000004';
+            const nativeBatchId = '64b64cfa12ecdd2d94000005';
+            batchRows = [...legacyRows, {
+                id: nativeBatchId,
+                email_id: LEGACY_EMAIL_ID,
+                status: 'submitted',
+                provider_id: 'native-provider-id',
+                recipient_count: 1,
+                recipient_hash: crypto.createHash('sha256').update(JSON.stringify([nativeMemberId])).digest('hex')
+            }];
+            recipients.push({batch_id: nativeBatchId, member_id: nativeMemberId, member_email: 'native@example.test'});
+
+            const recovery = await service.assertCanStartPartialResume(email);
+            assert.equal(recovery.renderHash, first.renderHash);
+        });
+
+        it('rejects an unmanifested legacy batch when no immutable proof exists', async function () {
+            const post = createModel({status: 'published'});
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                partial_resume: false,
+                post,
+                newsletter
+            });
+            const EmailBatch = createModelClass({
+                findAll: [{
+                    id: LEGACY_BATCH_IDS[0],
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: LEGACY_EMAIL_ID,
+                    recipient_count: null,
+                    recipient_hash: null
+                }]
+            });
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({recipients: []})
+            });
+            const getMissingRecipientCount = sinon.stub(service, 'getMissingRecipientCount');
+
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            sinon.assert.notCalled(getMissingRecipientCount);
+        });
+
+        it('keeps a manifest-backed native prefix eligible without a legacy proof', async function () {
+            const nativeBatchId = '64b64cfa12ecdd2d94000007';
+            const nativeMemberId = '64b64cfa12ecdd2d94000008';
+            const post = createCloneablePost({status: 'published', title: 'Native title', loaded: []});
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                partial_resume: false,
+                source: 'native lexical source',
+                source_type: 'lexical',
+                subject: 'Native title',
+                from: 'native@example.test',
+                reply_to: 'reply@example.test',
+                post,
+                newsletter
+            });
+            const EmailBatch = createModelClass({
+                findAll: [{
+                    id: nativeBatchId,
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: 'normal-provider-id',
+                    recipient_count: 1,
+                    recipient_hash: crypto.createHash('sha256').update(JSON.stringify([nativeMemberId])).digest('hex')
+                }]
+            });
+            const emailRenderer = {
+                getSegments: sinon.stub().resolves([null]),
+                getSubject: sinon.stub().returns('Native title'),
+                getFromAddress: sinon.stub().returns('native@example.test'),
+                getReplyToAddress: sinon.stub().returns('reply@example.test'),
+                renderBody: sinon.stub().resolves({html: '<p>native</p>', plaintext: 'native', replacements: []})
+            };
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({recipients: [{
+                    batch_id: nativeBatchId,
+                    member_id: nativeMemberId,
+                    member_email: 'native@example.test'
+                }]}),
+                emailRenderer
+            });
+            sinon.stub(service, 'getMissingRecipientCount').resolves(1);
+
+            const result = await service.assertCanStartPartialResume(email);
+            assert.match(result.renderHash, /^[a-f0-9]{64}$/);
+        });
+
+        it('rejects ambiguous legacy states and provider identities before preflight', async function () {
+            const cases = [
+                {name: 'wrong provider id', status: 'submitted', providerId: 'unexpected-provider-id'},
+                {name: 'pending batch', status: 'pending', providerId: LEGACY_EMAIL_ID},
+                {name: 'submitting batch', status: 'submitting', providerId: LEGACY_EMAIL_ID},
+                {name: 'failed batch', status: 'failed', providerId: LEGACY_EMAIL_ID}
+            ];
+            for (const testCase of cases) {
+                const {publicKey, row: proof} = createStoredLegacyProof();
+                const post = createModel({status: 'published'});
+                const newsletter = createModel({status: 'active'});
+                const email = createModel({id: LEGACY_EMAIL_ID, partial_resume: false, post, newsletter});
+                const EmailBatch = createModelClass({
+                    findAll: LEGACY_BATCH_IDS.map((id, index) => ({
+                        id,
+                        email_id: LEGACY_EMAIL_ID,
+                        status: index === 1 ? testCase.status : 'submitted',
+                        provider_id: index === 1 ? testCase.providerId : LEGACY_EMAIL_ID,
+                        recipient_count: null,
+                        recipient_hash: null
+                    }))
+                });
+                const service = new BatchSendingService({
+                    models: {EmailBatch},
+                    db: createLegacyProofDb({proof, recipients: []}),
+                    config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined}
+                });
+                const getMissingRecipientCount = sinon.stub(service, 'getMissingRecipientCount');
+
+                await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/, testCase.name);
+                sinon.assert.notCalled(getMissingRecipientCount);
+            }
+        });
+
+        it('rejects a legacy proof whose current recipient ledger no longer matches', async function () {
+            const {publicKey, row: proof} = createStoredLegacyProof();
+            const post = createModel({status: 'published'});
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({id: LEGACY_EMAIL_ID, partial_resume: false, post, newsletter});
+            const EmailBatch = createModelClass({
+                findAll: LEGACY_BATCH_IDS.map(id => ({
+                    id,
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: LEGACY_EMAIL_ID,
+                    recipient_count: null,
+                    recipient_hash: null
+                }))
+            });
+            const recipients = [
+                {batch_id: LEGACY_BATCH_IDS[0], member_id: '64b64cfa12ecdd2d94000006', member_email: LEGACY_MEMBER_EMAILS[0]},
+                {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[1]}
+            ];
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({proof, recipients}),
+                config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined}
+            });
+            const getMissingRecipientCount = sinon.stub(service, 'getMissingRecipientCount');
+
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            sinon.assert.notCalled(getMissingRecipientCount);
+        });
+
+        it('rejects a persisted proof whose canonical hash was altered', async function () {
+            const {publicKey, row: proof} = createStoredLegacyProof();
+            proof.proof_hash = '0'.repeat(64);
+            const post = createModel({status: 'published'});
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                partial_resume: false,
+                post,
+                newsletter
+            });
+            const EmailBatch = createModelClass({
+                findAll: LEGACY_BATCH_IDS.map(id => ({
+                    id,
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: LEGACY_EMAIL_ID,
+                    recipient_count: null,
+                    recipient_hash: null
+                }))
+            });
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({proof, recipients: []}),
+                config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined}
+            });
+            const getMissingRecipientCount = sinon.stub(service, 'getMissingRecipientCount');
+
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            sinon.assert.notCalled(getMissingRecipientCount);
+        });
+
+        it('propagates persisted header overrides to each continuation batch', async function () {
+            const service = new BatchSendingService({
+                sendingService: {
+                    getTargetDeliveryWindow() {
+                        return 0;
+                    }
+                }
+            });
+            const sendBatch = sinon.stub(service, 'sendBatch').resolves(true);
+            const emailSnapshot = {
+                subject: 'Original subject',
+                from: 'original@example.test',
+                replyTo: 'reply@example.test'
+            };
+
+            await service.sendBatches({
+                email: createModel({}),
+                batches: [createModel({})],
+                post: createModel({}),
+                newsletter: createModel({}),
+                emailSnapshot
+            });
+
+            sinon.assert.calledOnce(sendBatch);
+            assert.equal(sendBatch.firstCall.args[0].emailSnapshot, emailSnapshot);
+        });
+
+        it('blocks a continuation job with a changed render contract before materialization or dispatch', async function () {
+            const {publicKey, row: proof} = createStoredLegacyProof();
+            const recipients = [
+                {batch_id: LEGACY_BATCH_IDS[0], member_id: LEGACY_MEMBER_IDS[0], member_email: LEGACY_MEMBER_EMAILS[0]},
+                {batch_id: LEGACY_BATCH_IDS[1], member_id: LEGACY_MEMBER_IDS[1], member_email: LEGACY_MEMBER_EMAILS[1]}
+            ];
+            const post = createCloneablePost({
+                status: 'published',
+                title: 'Original title',
+                lexical: 'live lexical',
+                loaded: []
+            });
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                partial_resume: true,
+                partial_resume_render_hash: '0'.repeat(64),
+                source: 'original lexical',
+                source_type: 'lexical',
+                subject: 'Original title',
+                from: 'original@example.test',
+                reply_to: 'reply@example.test',
+                post,
+                newsletter
+            });
+            const EmailBatch = createModelClass({
+                findAll: LEGACY_BATCH_IDS.map(id => ({
+                    id,
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: LEGACY_EMAIL_ID,
+                    recipient_count: null,
+                    recipient_hash: null
+                }))
+            });
+            const emailRenderer = {
+                getSegments: sinon.stub().resolves([null]),
+                getSubject: sinon.stub().returns('Original title'),
+                getFromAddress: sinon.stub().returns('original@example.test'),
+                getReplyToAddress: sinon.stub().returns('reply@example.test'),
+                renderBody: sinon.stub().resolves({html: '<p>original</p>', plaintext: 'original', replacements: []})
+            };
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({proof, recipients}),
+                config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined},
+                emailRenderer
+            });
+            const createBatches = sinon.stub(service, 'createBatches');
+            const sendBatches = sinon.stub(service, 'sendBatches');
+
+            await assert.rejects(service.sendPartialEmail(email), /cannot be safely continued/);
+            sinon.assert.notCalled(createBatches);
+            sinon.assert.notCalled(sendBatches);
+        });
+
+        it('rejects an extra batch before the initial legacy CAS', async function () {
+            const {publicKey, row: proof} = createStoredLegacyProof();
+            const post = createModel({status: 'published'});
+            const newsletter = createModel({status: 'active'});
+            const email = createModel({
+                id: LEGACY_EMAIL_ID,
+                partial_resume: false,
+                post,
+                newsletter
+            });
+            const EmailBatch = createModelClass({
+                findAll: [...LEGACY_BATCH_IDS, '64b64cfa12ecdd2d94000003'].map(id => ({
+                    id,
+                    email_id: LEGACY_EMAIL_ID,
+                    status: 'submitted',
+                    provider_id: LEGACY_EMAIL_ID,
+                    recipient_count: null,
+                    recipient_hash: null
+                }))
+            });
+            const service = new BatchSendingService({
+                models: {EmailBatch},
+                db: createLegacyProofDb({proof, recipients: []}),
+                config: {get: key => key === LEGACY_PROOF_PUBLIC_KEY_CONFIG ? publicKey : undefined}
+            });
+            const getMissingRecipientCount = sinon.stub(service, 'getMissingRecipientCount');
+
+            await assert.rejects(service.assertCanStartPartialResume(email), /cannot be safely continued/);
+            sinon.assert.notCalled(getMissingRecipientCount);
         });
     });
 });

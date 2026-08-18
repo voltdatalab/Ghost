@@ -454,6 +454,71 @@ describe('Email Controller', function () {
         });
     });
 
+    describe('admitLegacyPartialResumeProof', function () {
+        it('loads only the route email id and forwards the exact signed proof to the service', async function () {
+            const email = createModel({id: '64b000000000000000000001'});
+            const Email = createModelClass();
+            Email.findOne = sinon.stub().resolves(email);
+            const service = {
+                admitLegacyPartialResumeProof: sinon.stub().resolves(email)
+            };
+            const controller = new EmailController(service, {models: {Email}});
+            const proof = {version: 1};
+
+            const result = await controller.admitLegacyPartialResumeProof({
+                options: {},
+                data: {
+                    id: '64b000000000000000000001',
+                    proof,
+                    signature: 'signed-proof'
+                }
+            });
+
+            assert.equal(result, email);
+            sinon.assert.calledOnceWithExactly(Email.findOne, {id: '64b000000000000000000001'}, {require: false});
+            sinon.assert.calledOnceWithExactly(service.admitLegacyPartialResumeProof, email, {proof, signature: 'signed-proof'});
+        });
+
+        it('rejects arrays, invalid ids, and unexpected fields before loading an email', async function () {
+            const Email = createModelClass();
+            Email.findOne = sinon.stub();
+            const service = {
+                admitLegacyPartialResumeProof: sinon.stub()
+            };
+            const controller = new EmailController(service, {models: {Email}});
+            const validData = {
+                id: '64b000000000000000000001',
+                proof: {version: 1},
+                signature: 'signed-proof'
+            };
+
+            await assert.rejects(controller.admitLegacyPartialResumeProof({options: {}, data: {...validData, extra: true}}), {errorType: 'BadRequestError'});
+            await assert.rejects(controller.admitLegacyPartialResumeProof({options: {}, data: {...validData, id: [validData.id]}}), {errorType: 'BadRequestError'});
+            await assert.rejects(controller.admitLegacyPartialResumeProof({options: {}, data: {...validData, proof: [validData.proof]}}), {errorType: 'BadRequestError'});
+            await assert.rejects(controller.admitLegacyPartialResumeProof({options: {}, data: {...validData, signature: ['signed-proof']}}), {errorType: 'BadRequestError'});
+            await assert.rejects(controller.admitLegacyPartialResumeProof({options: {}, data: {...validData, id: 'not-an-object-id'}}), {errorType: 'BadRequestError'});
+            sinon.assert.notCalled(Email.findOne);
+            sinon.assert.notCalled(service.admitLegacyPartialResumeProof);
+        });
+
+        it('throws not found when the route email does not exist', async function () {
+            const controller = new EmailController({}, {
+                models: {
+                    Email: createModelClass({findOne: null})
+                }
+            });
+
+            await assert.rejects(controller.admitLegacyPartialResumeProof({
+                options: {},
+                data: {
+                    id: '64b000000000000000000001',
+                    proof: {version: 1},
+                    signature: 'signed-proof'
+                }
+            }), /Email not found/);
+        });
+    });
+
     describe('retryFailedEmail', function () {
         it('throws if email not found', async function () {
             const controller = new EmailController({}, {

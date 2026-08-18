@@ -107,7 +107,7 @@ class SendingService {
      * @param {EmailSendingOptions} options
      * @returns {Promise<EmailProviderSuccessResponse>}
     */
-    async send({post, newsletter, segment, members, emailId}, options) {
+    async send({post, newsletter, segment, members, emailId, emailSnapshot}, options) {
         const cacheId = emailId + '-' + (segment ?? 'null');
         const isTestEmail = options.isTestEmail ?? false;
 
@@ -135,10 +135,15 @@ class SendingService {
         }
 
         const recipients = this.buildRecipients(members, emailBody.replacements);
-        return await this.#emailProvider.send({
+        const headers = emailSnapshot ?? {
             subject: this.#emailRenderer.getSubject(post, isTestEmail),
             from: this.#emailRenderer.getFromAddress(post, newsletter, !!options.useFallbackAddress),
-            replyTo: this.#emailRenderer.getReplyToAddress(post, newsletter, !!options.useFallbackAddress) ?? undefined,
+            replyTo: this.#emailRenderer.getReplyToAddress(post, newsletter, !!options.useFallbackAddress) ?? undefined
+        };
+        return await this.#emailProvider.send({
+            subject: headers.subject,
+            from: headers.from,
+            replyTo: headers.replyTo,
             html: emailBody.html,
             plaintext: emailBody.plaintext,
             recipients,
@@ -175,7 +180,7 @@ class SendingService {
             // Remove invalid recipient email addresses
             const isValidRecipient = validator.isEmail(recipient.email, {legacy: false});
             if (!isValidRecipient) {
-                logging.warn(`Removed recipient ${recipient.email} from list because it is not a valid email address`);
+                logging.warn('Removed an invalid recipient from the email send list');
             }
             return isValidRecipient;
         });
