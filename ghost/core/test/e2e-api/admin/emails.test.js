@@ -1,6 +1,5 @@
 const {agentProvider, fixtureManager, matchers, mockManager} = require('../../utils/e2e-framework');
 const {nullable, anyContentVersion, anyEtag, anyObjectId, anyUuid, anyISODateTime, anyString} = matchers;
-const {sendEmail} = require('../../utils/batch-email-utils');
 const configUtils = require('../../utils/config-utils');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -134,32 +133,45 @@ describe('Emails API', function () {
     });
 
     it('admits a reconciled legacy proxy proof without scheduling, dispatch, or mutable email changes', async function () {
-        configUtils.set('bulkEmail:batchSize', 2);
         const keyPair = crypto.generateKeyPairSync('ed25519');
         configUtils.set('bulkEmail:partialResume:legacyProxyPublicKey', keyPair.publicKey.export({type: 'spki', format: 'pem'}));
 
-        // The synthetic setup sends through the existing local mock to materialize
-        // normal Ghost rows. Admission below is measured only after resetHistory.
-        const {emailModel} = await sendEmail(agent);
-        const batches = (await models.EmailBatch.findAll({filter: `email_id:'${emailModel.id}'`})).models;
+        // Build a provider-confirmed legacy prefix directly from the E2E fixture.
+        // Admission must stay read-only: it cannot need a synthetic provider call
+        // just to create rows that already exist in the Ghost ledger.
+        const emailModel = await models.Email.findOne({id: fixtureManager.get('emails', 0).id}, {require: true});
+        const [firstBatch] = (await models.EmailBatch.findAll({filter: `email_id:'${emailModel.id}'`})).models;
+        assert.ok(firstBatch);
+        const originalFirstBatch = {
+            status: firstBatch.get('status'),
+            provider_id: firstBatch.get('provider_id')
+        };
+        await firstBatch.save({status: 'submitted', provider_id: emailModel.id}, {patch: true, autoRefresh: false});
+        const secondBatch = await models.EmailBatch.add({
+            id: crypto.randomBytes(12).toString('hex'),
+            email_id: emailModel.id,
+            status: 'submitted',
+            provider_id: emailModel.id,
+            fallback_sending_domain: false
+        });
         const recipients = (await models.EmailRecipient.findAll({filter: `email_id:'${emailModel.id}'`})).models;
-        assert.equal(batches.length, 2);
-        assert.ok(recipients.length > 0);
-        for (const batch of batches) {
-            await batch.save({status: 'submitted', provider_id: emailModel.id}, {patch: true, autoRefresh: false});
-        }
+        assert.ok(recipients.length > 1);
+        const originalRecipientBatchId = recipients[0].get('batch_id');
+        await recipients[0].save({batch_id: secondBatch.id}, {patch: true, autoRefresh: false});
+        const batches = [firstBatch, secondBatch];
+        const mailgunStub = mockManager.getMailgunCreateMessageStub();
+        mailgunStub.resetHistory();
+
         const signedProof = createSignedLegacyProof({
             emailId: emailModel.id,
             batches,
             recipients,
             privateKey: keyPair.privateKey
         });
-        const mailgunStub = mockManager.getMailgunCreateMessageStub();
-        mailgunStub.resetHistory();
 
         await agent
             .put(`emails/${emailModel.id}/partial-resume/legacy-proxy-proof`)
-            .body(signedProof)
+            .body({id: emailModel.id, ...signedProof})
             .expectStatus(200)
             .matchBodySnapshot({emails: [matchEmail]});
 
@@ -179,10 +191,16 @@ describe('Emails API', function () {
 
         await agent
             .put(`emails/${emailModel.id}/partial-resume/legacy-proxy-proof`)
-            .body(signedProof)
+            .body({id: emailModel.id, ...signedProof})
             .expectStatus(400);
         assert.equal((await db.knex('email_partial_resume_proofs').where({email_id: emailModel.id})).length, 1);
         sinon.assert.notCalled(mailgunStub);
+
+        // Keep the shared E2E fixture intact for the batch-browse assertions below.
+        await db.knex('email_partial_resume_proofs').where({email_id: emailModel.id}).delete();
+        await db.knex('email_recipients').where({id: recipients[0].id}).update({batch_id: originalRecipientBatchId});
+        await db.knex('email_batches').where({id: secondBatch.id}).delete();
+        await db.knex('email_batches').where({id: firstBatch.id}).update(originalFirstBatch);
     });
 
     it('Can browse email batches', async function () {
