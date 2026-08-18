@@ -917,6 +917,12 @@ module.exports = {
         // restart so boot recovery returns to the anti-join continuation path instead
         // of treating a partially-materialized email as a generic retry.
         partial_resume: {type: 'boolean', nullable: false, defaultTo: false},
+        // SHA-256 of the in-memory render contract approved for a partial continuation.
+        // Null means no legacy continuation contract has been admitted yet.
+        partial_resume_render_hash: {type: 'string', maxlength: 64, nullable: true},
+        // Internal per-enqueue ownership token used only during partial recovery.
+        // It is cleared before dispatch and never exposed as an email error.
+        partial_resume_enqueue_claim: {type: 'string', maxlength: 36, nullable: true},
         recipient_filter: {
             type: 'text',
             maxlength: 1000000000,
@@ -973,6 +979,17 @@ module.exports = {
         error_data: {type: 'text', maxlength: 1000000000, fieldtype: 'long', nullable: true},
         created_at: {type: 'dateTime', nullable: false},
         updated_at: {type: 'dateTime', nullable: false}
+    },
+    // Immutable aggregate evidence only: no recipient identities, content, or provider secrets.
+    email_partial_resume_proofs: {
+        id: {type: 'string', maxlength: 24, nullable: false, primary: true},
+        email_id: {type: 'string', maxlength: 24, nullable: false, unique: true, references: 'emails.id', restrictDelete: true},
+        proof_payload: {type: 'string', maxlength: 4096, nullable: false},
+        proof_hash: {type: 'string', maxlength: 64, nullable: false},
+        signature: {type: 'string', maxlength: 86, nullable: false},
+        signing_key_fingerprint: {type: 'string', maxlength: 64, nullable: false},
+        transport: {type: 'string', maxlength: 50, nullable: false},
+        created_at: {type: 'dateTime', nullable: false}
     },
     email_recipients: {
         id: {type: 'string', maxlength: 24, nullable: false, primary: true},

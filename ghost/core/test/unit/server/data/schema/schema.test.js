@@ -78,6 +78,29 @@ describe('schema validations', function () {
         });
     });
 
+    it('declares aggregate-only legacy partial-resume proof storage for fresh sites', function () {
+        assert.deepEqual(schema.emails.partial_resume_render_hash, {
+            type: 'string',
+            maxlength: 64,
+            nullable: true
+        });
+        assert.deepEqual(schema.emails.partial_resume_enqueue_claim, {
+            type: 'string',
+            maxlength: 36,
+            nullable: true
+        });
+        assert.deepEqual(schema.email_partial_resume_proofs, {
+            id: {type: 'string', maxlength: 24, nullable: false, primary: true},
+            email_id: {type: 'string', maxlength: 24, nullable: false, unique: true, references: 'emails.id', restrictDelete: true},
+            proof_payload: {type: 'string', maxlength: 4096, nullable: false},
+            proof_hash: {type: 'string', maxlength: 64, nullable: false},
+            signature: {type: 'string', maxlength: 86, nullable: false},
+            signing_key_fingerprint: {type: 'string', maxlength: 64, nullable: false},
+            transport: {type: 'string', maxlength: 50, nullable: false},
+            created_at: {type: 'dateTime', nullable: false}
+        });
+    });
+
     // MySQL rejects an identifier over 64 characters, and knex derives index and
     // constraint names from the table plus every column in them, so a wide index on a
     // long table name overruns it. SQLite has no such limit, so a migration that trips

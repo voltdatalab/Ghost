@@ -397,6 +397,7 @@ module.exports = function apiRoutes() {
     router.get('/emails/:id', mw.authAdminApi, http(api.emails.read));
     router.put('/emails/:id/retry', mw.authAdminApi, http(api.emails.retry));
     router.put('/emails/:id/partial-resume', mw.authAdminApi, http(api.emails.partialResume));
+    router.put('/emails/:id/partial-resume/legacy-proxy-proof', mw.authAdminApi, http(api.emails.legacyPartialResumeProof));
     router.get('/emails/:id/batches', mw.authAdminApi, http(api.emails.browseBatches));
     router.get('/emails/:id/recipient-failures', mw.authAdminApi, http(api.emails.browseFailures));
     router.get('/emails/:id/analytics', mw.authAdminApi, http(api.emails.analyticsStatus));

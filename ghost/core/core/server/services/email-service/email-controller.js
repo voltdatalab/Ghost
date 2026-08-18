@@ -8,7 +8,8 @@ const messages = {
     tooManyEmailsProvided: 'Too many emails provided. Maximum of 1 test email can be sent at once.',
     invalidMemberStatus: 'member_status must be \'free\' or \'paid\'.',
     invalidMemberTier: 'member_tier must be a single tier slug.',
-    invalidMemberSegment: 'memberSegment is deprecated and only accepts \'status:free\' or \'status:-free\' — use member_status instead.'
+    invalidMemberSegment: 'memberSegment is deprecated and only accepts \'status:free\' or \'status:-free\' — use member_status instead.',
+    invalidLegacyProofRequest: 'Legacy partial-resume proof requests must contain exactly id, proof, and signature.'
 };
 
 // deprecated memberSegment values older clients send, mapped onto the
@@ -17,6 +18,14 @@ const LEGACY_SEGMENT_STATUSES = {
     'status:free': 'free',
     'status:-free': 'paid'
 };
+
+/**
+ * @param {unknown} value
+ * @returns {value is Record<string, unknown>}
+ */
+function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
 
 class EmailController {
     service;
@@ -143,6 +152,35 @@ class EmailController {
         }
 
         return await this.service.resumePartialEmail(email);
+    }
+
+    async admitLegacyPartialResumeProof(frame) {
+        const data = frame?.data;
+        const allowedFields = ['id', 'proof', 'signature'];
+        const hasExactShape = isPlainObject(data) &&
+            Object.keys(data).length === allowedFields.length &&
+            allowedFields.every(field => Object.hasOwn(data, field));
+        const hasValidTypes = hasExactShape &&
+            typeof data.id === 'string' && /^[a-f0-9]{24}$/i.test(data.id) &&
+            isPlainObject(data.proof) &&
+            typeof data.signature === 'string';
+        if (!hasValidTypes) {
+            throw new errors.BadRequestError({
+                message: tpl(messages.invalidLegacyProofRequest)
+            });
+        }
+
+        const email = await this.models.Email.findOne({id: data.id}, {require: false});
+        if (!email) {
+            throw new errors.NotFoundError({
+                message: tpl(messages.emailNotFound)
+            });
+        }
+
+        return await this.service.admitLegacyPartialResumeProof(email, {
+            proof: data.proof,
+            signature: data.signature
+        });
     }
 }
 

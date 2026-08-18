@@ -2,6 +2,7 @@ const logging = require('@tryghost/logging');
 const ObjectID = require('bson-objectid').default;
 const crypto = require('node:crypto');
 const errors = require('@tryghost/errors');
+const {canonicalizeLegacyProofPayload, hashStringList, verifyLegacyProof} = require('./legacy-partial-resume-proof');
 const tpl = require('@tryghost/tpl');
 const messages = {
     emailErrorPartialFailure: 'An error occurred, and your newsletter was only partially sent. Please retry sending the remaining emails.',
@@ -10,6 +11,32 @@ const messages = {
 
 const MAX_SENDING_CONCURRENCY = 2;
 const SHUTDOWN_CODE = 'BULK_EMAIL_SHUTDOWN_IN_PROGRESS';
+const LEGACY_PROXY_PUBLIC_KEY_CONFIG = 'bulkEmail:partialResume:legacyProxyPublicKey';
+const LEGACY_PROOF_REVALIDATION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Serializes a render contract by value rather than Bookshelf's relation/attribute
+ * insertion order. Arrays intentionally preserve their order because segment order
+ * is part of the send contract.
+ *
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+function canonicalizeRenderContract(value) {
+    if (Array.isArray(value)) {
+        return value.map(canonicalizeRenderContract);
+    }
+    if (value && typeof value === 'object') {
+        if (typeof value.toJSON === 'function') {
+            return canonicalizeRenderContract(value.toJSON());
+        }
+        return Object.fromEntries(Object.entries(value)
+            .filter(([, entryValue]) => entryValue !== undefined)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, entryValue]) => [key, canonicalizeRenderContract(entryValue)]));
+    }
+    return value;
+}
 
 /**
  * @typedef {import('./sending-service')} SendingService
@@ -32,6 +59,7 @@ class BatchSendingService {
     #jobsService;
     #models;
     #db;
+    #config;
     #sentry;
     #debugStorageFilePath;
     #getRequiredUrlRelations;
@@ -56,6 +84,7 @@ class BatchSendingService {
      * @param {Email} dependencies.models.Email
      * @param {object} dependencies.models.Member
      * @param {object} dependencies.db
+     * @param {object} [dependencies.config]
      * @param {() => string[]} [dependencies.getRequiredUrlRelations] Post relations the live routes need loaded to generate URLs (lazy routing); defaults to none
      * @param {object} [dependencies.sentry]
      * @param {object} [dependencies.BEFORE_RETRY_CONFIG]
@@ -71,6 +100,7 @@ class BatchSendingService {
         domainWarmingService,
         models,
         db,
+        config,
         sentry,
         getRequiredUrlRelations = () => [],
         BEFORE_RETRY_CONFIG,
@@ -85,6 +115,7 @@ class BatchSendingService {
         this.#domainWarmingService = domainWarmingService;
         this.#models = models;
         this.#db = db;
+        this.#config = config;
         this.#sentry = sentry;
         this.#debugStorageFilePath = debugStorageFilePath;
         this.#getRequiredUrlRelations = getRequiredUrlRelations;
@@ -134,48 +165,89 @@ class BatchSendingService {
     }
 
     /**
-     * Schedules a background job that sends the email in the background if it is pending or failed.
+     * Schedules a background job that sends the email in the background.
+     * Strict partial-resume jobs may only claim a durable pending partial
+     * continuation; they deliberately never use the normal failed-email retry path.
      * @param {Email} email
-     * @returns {void}
+     * @param {{partialResume?: boolean, partialResumeClaimed?: boolean, partialResumeClaim?: string}} [options]
+     * @returns {Promise<unknown>}
      */
-    scheduleEmail(email, {partialResumeClaimed = false} = {}) {
+    scheduleEmail(email, {partialResume = false, partialResumeClaimed = false, partialResumeClaim} = {}) {
+        // partialResumeClaimed remains readable for jobs serialized by the earlier
+        // recovery protocol; both partial job forms stay out of normal retries.
+        const data = {emailId: email.id, partialResume, partialResumeClaimed};
+        if (typeof partialResumeClaim === 'string' && partialResumeClaim.length > 0) {
+            data.partialResumeClaim = partialResumeClaim;
+        }
         return this.#jobsService.addJob({
             name: 'batch-sending-service-job',
             job: this.emailJob.bind(this),
-            data: {emailId: email.id, partialResumeClaimed},
+            data,
             offloaded: false
         });
     }
 
     /**
      * @private
-     * @param {{emailId: string, partialResumeClaimed?: boolean}} data Data passed from the job service. We only need the emailId because we need to refetch the email anyway to make sure the status is right and 'locked'.
+     * @param {{emailId: string, partialResume?: boolean, partialResumeClaimed?: boolean, partialResumeClaim?: string}} data Data passed from the job service. The flags select the durable CAS contract before the email is refetched and locked.
      */
-    async emailJob({emailId, partialResumeClaimed = false}) {
+    async emailJob({emailId, partialResume = false, partialResumeClaimed = false, partialResumeClaim}) {
         logging.info(`Starting email job for email ${emailId}`);
 
         const startTime = Date.now();
+        const isPartialResumeJob = partialResume || partialResumeClaimed;
+        const allowedStatuses = partialResumeClaimed
+            ? ['submitting']
+            : ['pending'];
+        // A claimed recovery job carries the fresh enqueue token written by the
+        // scanner. Older serialized claimed jobs have no token and can only adopt
+        // the pre-token state (both internal claim and error are null).
+        const expectedError = isPartialResumeJob ? null : undefined;
+        const expectedPartialResumeEnqueueClaim = partialResumeClaimed
+            ? (typeof partialResumeClaim === 'string' && partialResumeClaim.length > 0 ? partialResumeClaim : null)
+            : (partialResume ? null : undefined);
+        const lockOptions = isPartialResumeJob
+            ? {
+                expectedPartialResume: true,
+                expectedError,
+                expectedPartialResumeEnqueueClaim
+            }
+            : undefined;
+        // Replace the enqueue token with a distinct worker-owned token before
+        // dispatch. Recovery will not requeue a submitting partial row while a
+        // non-null token says that a job owns it.
+        const lockData = isPartialResumeJob
+            ? {
+                error: null,
+                partial_resume_enqueue_claim: crypto.randomUUID()
+            }
+            : {};
 
-        // Change pending/failed email to submitting in one transaction. A boot scanner
-        // may have already claimed a partial continuation with pending -> submitting;
-        // that job can only proceed if it can re-lock the durable claimed state.
+        // Strict partial jobs always claim the exact durable state. A boot scanner
+        // may schedule the same row more than once, but only the job holding the
+        // marker can clear it and send; an ambiguously queued job cannot retry
+        // from failed or steal a live worker's claim.
         let email = await this.retryDb(
             async () => {
                 return await this.updateStatusLock(
                     this.#models.Email,
                     emailId,
                     'submitting',
-                    partialResumeClaimed ? ['submitting'] : ['pending', 'failed']
+                    allowedStatuses,
+                    lockData,
+                    lockOptions
                 );
             },
             {...this.#BEFORE_RETRY_CONFIG, description: `updateStatusLock email ${emailId} ${partialResumeClaimed ? '(partial already claimed)' : '-> submitting'}`}
         );
         if (!email) {
-            const expectedState = partialResumeClaimed ? 'was not in the expected claimed state' : 'is not pending or failed';
+            const expectedState = partialResumeClaimed
+                ? 'was not in the expected claimed state'
+                : (partialResume ? 'was not a pending partial continuation' : 'is not pending');
             logging.error(`Tried sending email that ${expectedState} ${emailId}`);
             return;
         }
-        if (partialResumeClaimed && email.get('partial_resume') !== true) {
+        if (isPartialResumeJob && email.get('partial_resume') !== true) {
             logging.error(`Tried running an already-claimed partial continuation for a non-partial email ${emailId}`);
             return;
         }
@@ -190,6 +262,12 @@ class BatchSendingService {
         email._retryCutOffTime = retryCutOffTime;
 
         const isPartialResume = email.get('partial_resume') === true;
+        // Partial workers always install a fresh token in the CAS above. Terminal
+        // writes must retain that ownership predicate: a stale scanner may have
+        // already failed the row while a slow worker was still winding down.
+        const partialResumeWorkerClaim = isPartialResume
+            ? email.get('partial_resume_enqueue_claim')
+            : undefined;
 
         try {
             if (isPartialResume) {
@@ -197,16 +275,71 @@ class BatchSendingService {
             } else {
                 await this.sendEmail(email);
             }
-            await this.retryDb(async () => {
-                await email.save({
-                    status: 'submitted',
-                    submitted_at: new Date(),
-                    error: null,
-                    partial_resume: false
-                }, {patch: true, autoRefresh: false});
-            }, {...this.#AFTER_RETRY_CONFIG, description: `email ${emailId} -> submitted`});
+            if (isPartialResume) {
+                const completed = await this.retryDb(async () => {
+                    return await this.updateStatusLock(
+                        this.#models.Email,
+                        emailId,
+                        'submitted',
+                        ['submitting'],
+                        {
+                            submitted_at: new Date(),
+                            error: null,
+                            partial_resume: false,
+                            partial_resume_enqueue_claim: null
+                        },
+                        {
+                            expectedPartialResume: true,
+                            expectedError: null,
+                            expectedPartialResumeEnqueueClaim: partialResumeWorkerClaim
+                        }
+                    );
+                }, {...this.#AFTER_RETRY_CONFIG, description: `partial email ${emailId} -> submitted`});
+                if (!completed) {
+                    logging.warn('Partial email completion claim was already changed; leaving it for fail-closed recovery');
+                }
+            } else {
+                await this.retryDb(async () => {
+                    await email.save({
+                        status: 'submitted',
+                        submitted_at: new Date(),
+                        error: null,
+                        partial_resume: false,
+                        partial_resume_enqueue_claim: null
+                    }, {patch: true, autoRefresh: false});
+                }, {...this.#AFTER_RETRY_CONFIG, description: `email ${emailId} -> submitted`});
+            }
         } catch (e) {
             if (e && e.code === SHUTDOWN_CODE) {
+                // A partial worker owns a generation-specific token while it is
+                // dispatching. Before an orderly shutdown leaves the row in
+                // `submitting`, release only that exact token. The next boot can
+                // then claim and resume it; a failed release remains fail-closed
+                // because recovery will never adopt an unknown live token.
+                if (isPartialResume) {
+                    const workerClaim = email.get('partial_resume_enqueue_claim');
+                    try {
+                        const released = await this.retryDb(async () => {
+                            return await this.updateStatusLock(
+                                this.#models.Email,
+                                emailId,
+                                'submitting',
+                                ['submitting'],
+                                {partial_resume_enqueue_claim: null},
+                                {
+                                    expectedPartialResume: true,
+                                    expectedError: null,
+                                    expectedPartialResumeEnqueueClaim: workerClaim
+                                }
+                            );
+                        }, {...this.#AFTER_RETRY_CONFIG, description: `release partial email ${emailId} claim for shutdown`});
+                        if (!released) {
+                            logging.warn('Partial email shutdown claim was already changed; leaving it for fail-closed recovery');
+                        }
+                    } catch (releaseError) {
+                        logging.error('Could not release partial email shutdown claim; leaving it for fail-closed recovery');
+                    }
+                }
                 logging.info(`Email ${email.id} send stopped because the container is shutting down — leaving status=submitting so it can resume on next boot`);
                 return;
             }
@@ -222,13 +355,39 @@ class BatchSendingService {
                 this.#sentry.captureException(e);
             }
 
-            // Store error and status in email model
-            await this.retryDb(async () => {
-                await email.save({
-                    status: 'failed',
-                    error: e.message || 'Something went wrong while sending the email'
-                }, {patch: true, autoRefresh: false});
-            }, {...this.#AFTER_RETRY_CONFIG, description: `email ${emailId} -> failed`});
+            // Store error and status in email model. A partial worker must still
+            // own its exact generation; otherwise a stale scanner's fail-closed
+            // state wins and this late worker cannot resurrect it.
+            if (isPartialResume) {
+                const failed = await this.retryDb(async () => {
+                    return await this.updateStatusLock(
+                        this.#models.Email,
+                        emailId,
+                        'failed',
+                        ['submitting'],
+                        {
+                            error: e.message || 'Something went wrong while sending the email',
+                            partial_resume_enqueue_claim: null
+                        },
+                        {
+                            expectedPartialResume: true,
+                            expectedError: null,
+                            expectedPartialResumeEnqueueClaim: partialResumeWorkerClaim
+                        }
+                    );
+                }, {...this.#AFTER_RETRY_CONFIG, description: `partial email ${emailId} -> failed`});
+                if (!failed) {
+                    logging.warn('Partial email failure claim was already changed; leaving it for fail-closed recovery');
+                }
+            } else {
+                await this.retryDb(async () => {
+                    await email.save({
+                        status: 'failed',
+                        error: e.message || 'Something went wrong while sending the email',
+                        partial_resume_enqueue_claim: null
+                    }, {patch: true, autoRefresh: false});
+                }, {...this.#AFTER_RETRY_CONFIG, description: `email ${emailId} -> failed`});
+            }
         }
     }
 
@@ -258,22 +417,24 @@ class BatchSendingService {
      * partial continuation may start only from an already-submitted email.
      *
      * @param {Email} email
-     * @returns {Promise<{missingRecipientCount: number}>}
+     * @returns {Promise<{missingRecipientCount: number, renderHash: string}>}
      */
     async assertCanStartPartialResume(email) {
         const {newsletter, post} = await this.#getEmailRelations(email);
         this.#assertPartialResumeRelationsAreSafe(email, newsletter, post);
         const batches = await this.getBatches(email);
         await this.#assertPartialResumeBatchesAreSafe(email, batches);
+        const snapshot = await this.#createPartialResumeRenderSnapshot(email, newsletter, post);
+        this.#assertPartialResumeRenderHashIsSafe(email, snapshot.renderHash);
 
-        const missingRecipientCount = await this.getMissingRecipientCount({email, newsletter, post});
+        const missingRecipientCount = await this.getMissingRecipientCount({email, newsletter, post: snapshot.post});
         if (missingRecipientCount === 0) {
             throw new errors.BadRequestError({
                 message: `Email ${email.id} has no eligible recipients left to resume`
             });
         }
 
-        return {missingRecipientCount};
+        return {missingRecipientCount, renderHash: snapshot.renderHash};
     }
 
     /**
@@ -292,6 +453,8 @@ class BatchSendingService {
             return await this.getBatches(email);
         }, {...this.#getBeforeRetryConfig(email), description: `get existing batches for partial email ${email.id}`});
         await this.#assertPartialResumeBatchesAreSafe(email, existingBatches);
+        const snapshot = await this.#createPartialResumeRenderSnapshot(email, newsletter, post);
+        this.#assertPartialResumeRenderHashIsSafe(email, snapshot.renderHash);
 
         const existingRecipientCount = await this.retryDb(async () => {
             return await this.getRecipientCount(email);
@@ -303,7 +466,7 @@ class BatchSendingService {
         await this.createBatches({
             email,
             newsletter,
-            post,
+            post: snapshot.post,
             excludeExistingRecipients: true,
             existingRecipientCount
         });
@@ -323,7 +486,7 @@ class BatchSendingService {
             return;
         }
 
-        await this.sendBatches({email, batches: batchesToSend, post, newsletter});
+        await this.sendBatches({email, batches: batchesToSend, post: snapshot.post, newsletter, emailSnapshot: snapshot.emailSnapshot});
     }
 
     /**
@@ -365,6 +528,135 @@ class BatchSendingService {
         }
     }
 
+    #partialResumeSafetyError(email) {
+        return new errors.BadRequestError({
+            message: `Email ${email.id} cannot be safely continued; reconcile its immutable partial-resume evidence before continuing`
+        });
+    }
+
+    #assertPartialResumeRenderHashIsSafe(email, renderHash) {
+        if (typeof renderHash !== 'string' || !/^[a-f0-9]{64}$/.test(renderHash)) {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        const storedRenderHash = email.get('partial_resume_render_hash');
+        if (email.get('partial_resume') === true) {
+            if (storedRenderHash !== renderHash) {
+                throw this.#partialResumeSafetyError(email);
+            }
+        } else if (storedRenderHash !== null && storedRenderHash !== undefined) {
+            // A completed partial continuation retains its hash. It must never be
+            // silently re-opened as a fresh continuation with a different contract.
+            throw this.#partialResumeSafetyError(email);
+        }
+    }
+
+    async #createPartialResumeRenderSnapshot(email, newsletter, post) {
+        const source = email.get('source');
+        const sourceType = email.get('source_type');
+        if (typeof source !== 'string' || source.length === 0 || !['lexical', 'mobiledoc'].includes(sourceType) || typeof post.clone !== 'function') {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        const snapshot = post.clone();
+        if (!snapshot || typeof snapshot.set !== 'function' || typeof snapshot.get !== 'function') {
+            throw this.#partialResumeSafetyError(email);
+        }
+        // Bookshelf clones attributes but not necessarily eager-loaded relations. The
+        // renderer reads posts_meta/authors/tiers/URLs from those relations, so retain
+        // their immutable in-memory references on the otherwise unsaved snapshot.
+        if (post.relations && typeof post.relations === 'object') {
+            snapshot.relations = {...post.relations};
+        }
+        snapshot.set({
+            lexical: sourceType === 'lexical' ? source : null,
+            mobiledoc: sourceType === 'mobiledoc' ? source : null,
+            html: null,
+            plaintext: null
+        });
+
+        const subject = email.get('subject');
+        const from = email.get('from');
+        const replyTo = email.get('reply_to') ?? null;
+        if (typeof subject !== 'string' || subject.length === 0 ||
+            typeof from !== 'string' || from.length === 0 ||
+            (replyTo !== null && typeof replyTo !== 'string')) {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        const expectedSubject = this.#emailRenderer.getSubject(snapshot, false);
+        const expectedFrom = this.#emailRenderer.getFromAddress(snapshot, newsletter, false);
+        const expectedReplyTo = this.#emailRenderer.getReplyToAddress(snapshot, newsletter, false) ?? null;
+        if (subject !== expectedSubject || from !== expectedFrom || replyTo !== expectedReplyTo) {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        const clickTrackingEnabled = !!email.get('track_clicks');
+        const openTrackingEnabled = !!email.get('track_opens');
+        const segments = await this.#emailRenderer.getSegments(snapshot);
+        if (!Array.isArray(segments) || segments.length === 0) {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        const seenSegments = new Set();
+        const renderedSegments = [];
+        for (const segment of segments) {
+            if (segment !== null && typeof segment !== 'string') {
+                throw this.#partialResumeSafetyError(email);
+            }
+            const segmentKey = JSON.stringify(segment);
+            if (seenSegments.has(segmentKey)) {
+                throw this.#partialResumeSafetyError(email);
+            }
+            seenSegments.add(segmentKey);
+
+            // Click tracking allocates a fresh redirect for every render. The
+            // integrity snapshot must be read-only and deterministic; preserve the
+            // user's tracking choice in `contract.tracking`, but hash the body
+            // before that per-render redirect allocation. The worker later renders
+            // the actual tail with click tracking enabled as configured.
+            const body = await this.#emailRenderer.renderBody(snapshot, newsletter, segment, {clickTrackingEnabled: false});
+            if (!body || typeof body.html !== 'string' || typeof body.plaintext !== 'string' || !Array.isArray(body.replacements) ||
+                body.replacements.some(replacement => !replacement || typeof replacement.id !== 'string' || replacement.id.length === 0)) {
+                throw this.#partialResumeSafetyError(email);
+            }
+            renderedSegments.push({
+                segment,
+                html_hash: crypto.createHash('sha256').update(body.html, 'utf8').digest('hex'),
+                plaintext_hash: crypto.createHash('sha256').update(body.plaintext, 'utf8').digest('hex'),
+                replacement_ids: body.replacements.map(replacement => replacement.id)
+            });
+        }
+
+        const newsletterSnapshot = typeof newsletter.toJSON === 'function' ? newsletter.toJSON() : undefined;
+        if (!newsletterSnapshot || typeof newsletterSnapshot !== 'object') {
+            throw this.#partialResumeSafetyError(email);
+        }
+        const postMeta = typeof snapshot.related === 'function' ? snapshot.related('posts_meta') : undefined;
+        const contract = {
+            version: 1,
+            source_type: sourceType,
+            source_hash: crypto.createHash('sha256').update(source, 'utf8').digest('hex'),
+            post_title: snapshot.get('title') ?? null,
+            post_email_subject: postMeta?.get?.('email_subject') ?? null,
+            headers: {subject, from, reply_to: replyTo},
+            expected_headers: {subject: expectedSubject, from: expectedFrom, reply_to: expectedReplyTo},
+            newsletter: newsletterSnapshot,
+            tracking: {clicks: clickTrackingEnabled, opens: openTrackingEnabled},
+            segments: renderedSegments
+        };
+        const serializedContract = JSON.stringify(canonicalizeRenderContract(contract));
+        if (typeof serializedContract !== 'string') {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        return {
+            post: snapshot,
+            emailSnapshot: {subject, from, replyTo: replyTo ?? undefined},
+            renderHash: crypto.createHash('sha256').update(serializedContract, 'utf8').digest('hex')
+        };
+    }
+
     /**
      * Fails closed if a batch could have reached the provider without a durable
      * submitted status, or if the original email has no confirmed prefix.
@@ -376,25 +668,126 @@ class BatchSendingService {
     async #assertPartialResumeBatchesAreSafe(email, batches) {
         const confirmedBatches = batches.filter(batch => batch.get('status') === 'submitted' && batch.get('provider_id'));
         if (confirmedBatches.length === 0) {
-            throw new errors.BadRequestError({
-                message: `Email ${email.id} has no provider-confirmed batches to continue`
-            });
+            throw this.#partialResumeSafetyError(email);
         }
 
         const unsafeBatch = batches.find((batch) => {
             const status = batch.get('status');
             const providerId = batch.get('provider_id');
-            return (status === 'submitted' && !providerId) ||
+            return typeof batch.id !== 'string' || batch.get('email_id') !== email.id ||
+                (status === 'submitted' && !providerId) ||
                 (status === 'pending' && providerId) ||
                 !['submitted', 'pending'].includes(status);
         });
         if (unsafeBatch) {
-            throw new errors.BadRequestError({
-                message: `Email ${email.id} has batch ${unsafeBatch.id} in unsafe status=${unsafeBatch.get('status')}; reconcile provider state before continuing`
-            });
+            throw this.#partialResumeSafetyError(email);
         }
 
-        await this.#assertConfirmedBatchRecipientLedgersAreIntact(email, batches, confirmedBatches);
+        const batchesWithoutNativeManifest = batches.filter(batch => !this.#hasValidRecipientManifest(batch));
+        const providerIds = confirmedBatches.map(batch => batch.get('provider_id'));
+        const hasSharedProviderId = new Set(providerIds).size !== providerIds.length;
+        const requiresLegacyProof = batchesWithoutNativeManifest.length > 0 || hasSharedProviderId;
+        let legacyProof;
+
+        // A proof may exist even after a legacy row has gained a manifest. Always
+        // revalidate one when the shared DB is available so signed IDs keep their
+        // stricter provider identity rule; native-only emails still need no proof.
+        if (requiresLegacyProof || (this.#db && typeof this.#db.knex === 'function')) {
+            legacyProof = await this.#loadPersistedLegacyPartialResumeProof(email);
+        }
+        if (requiresLegacyProof && !legacyProof) {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        if (legacyProof) {
+            const legacyBatchIds = new Set(legacyProof.legacy_batch_ids);
+            const signedBatches = batches.filter(batch => legacyBatchIds.has(batch.id));
+            if (signedBatches.length !== legacyBatchIds.size ||
+                batchesWithoutNativeManifest.some(batch => !legacyBatchIds.has(batch.id)) ||
+                signedBatches.some(batch => batch.get('status') !== 'submitted' || batch.get('provider_id') !== email.id)) {
+                throw this.#partialResumeSafetyError(email);
+            }
+
+            // Before the first CAS, the signed prefix must be the complete existing
+            // ledger. Recovery may additionally contain only manifest-backed batches.
+            if (email.get('partial_resume') !== true &&
+                (batches.length !== legacyBatchIds.size || batches.some(batch => !legacyBatchIds.has(batch.id)))) {
+                throw this.#partialResumeSafetyError(email);
+            }
+        }
+
+        await this.#assertConfirmedBatchRecipientLedgersAreIntact(email, batches, confirmedBatches, legacyProof);
+    }
+
+    #hasValidRecipientManifest(batch) {
+        return Number.isSafeInteger(Number(batch.get('recipient_count'))) && Number(batch.get('recipient_count')) > 0 &&
+            typeof batch.get('recipient_hash') === 'string' && /^[a-f0-9]{64}$/.test(batch.get('recipient_hash'));
+    }
+
+    async #loadPersistedLegacyPartialResumeProof(email) {
+        if (!this.#db || typeof this.#db.knex !== 'function') {
+            throw this.#partialResumeSafetyError(email);
+        }
+        const rows = await this.#db.knex('email_partial_resume_proofs')
+            .select('email_id', 'proof_payload', 'proof_hash', 'signature', 'signing_key_fingerprint', 'transport')
+            .where('email_id', email.id);
+        if (!Array.isArray(rows)) {
+            throw this.#partialResumeSafetyError(email);
+        }
+        if (rows.length === 0) {
+            return null;
+        }
+        if (rows.length !== 1) {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        const row = rows[0];
+        if (!row || row.email_id !== email.id || typeof row.proof_payload !== 'string' ||
+            typeof row.proof_hash !== 'string' || !/^[a-f0-9]{64}$/.test(row.proof_hash) ||
+            typeof row.signature !== 'string' || typeof row.signing_key_fingerprint !== 'string' ||
+            !/^[a-f0-9]{64}$/.test(row.signing_key_fingerprint) || typeof row.transport !== 'string') {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        let proof;
+        let canonicalProof;
+        try {
+            proof = JSON.parse(row.proof_payload);
+            canonicalProof = canonicalizeLegacyProofPayload(proof);
+        } catch {
+            throw this.#partialResumeSafetyError(email);
+        }
+        if (canonicalProof.payloadJson !== row.proof_payload ||
+            crypto.createHash('sha256').update(row.proof_payload, 'utf8').digest('hex') !== row.proof_hash ||
+            canonicalProof.payload.email_id !== email.id || canonicalProof.payload.transport !== row.transport) {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        const publicKey = this.#config?.get?.(LEGACY_PROXY_PUBLIC_KEY_CONFIG);
+        if (typeof publicKey !== 'string' || publicKey.length === 0) {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        let verifiedProof;
+        try {
+            // Freshness was enforced at immutable admission time. Re-verification
+            // here anchors the persisted signature to the configured public key
+            // without expiring an already-admitted continuation while it is queued.
+            verifiedProof = verifyLegacyProof({
+                proof: canonicalProof.payload,
+                signature: row.signature,
+                publicKey,
+                now: new Date(canonicalProof.payload.issued_at),
+                maxAgeMs: LEGACY_PROOF_REVALIDATION_MAX_AGE_MS
+            });
+        } catch {
+            throw this.#partialResumeSafetyError(email);
+        }
+        if (verifiedProof.payloadJson !== row.proof_payload || verifiedProof.signingKeyFingerprint !== row.signing_key_fingerprint) {
+            throw this.#partialResumeSafetyError(email);
+        }
+
+        return verifiedProof.payload;
     }
 
     /**
@@ -403,49 +796,82 @@ class BatchSendingService {
      * sent. Without this check, a deleted prefix row is indistinguishable from
      * an unmaterialized tail to an anti-join and could be sent twice.
      *
-     * Legacy batches with null manifests are deliberately rejected: reconstructing
-     * their expected recipients from current member state would not prove what
-     * the provider accepted at the time of the original send.
-     *
      * @private
      * @param {Email} email
      * @param {EmailBatch[]} batches
      * @param {EmailBatch[]} confirmedBatches
+     * @param {object|undefined} legacyProof
      */
-    async #assertConfirmedBatchRecipientLedgersAreIntact(email, batches, confirmedBatches) {
+    async #assertConfirmedBatchRecipientLedgersAreIntact(email, batches, confirmedBatches, legacyProof) {
         const recipientIdsByBatch = new Map(batches.map(batch => [batch.id, []]));
+        const recipientEmailsByBatch = new Map(batches.map(batch => [batch.id, []]));
+        const recipientTuplesByBatch = new Map(batches.map(batch => [batch.id, []]));
         const recipients = await this.#db.knex('email_recipients')
-            .select('batch_id', 'member_id')
+            .select('batch_id', 'member_id', 'member_email')
             .where('email_id', email.id);
+        if (!Array.isArray(recipients)) {
+            throw this.#partialResumeSafetyError(email);
+        }
 
+        const memberIds = new Set();
         for (const recipient of recipients) {
-            const recipientIds = recipientIdsByBatch.get(recipient.batch_id);
-            if (!recipientIds || typeof recipient.member_id !== 'string' || recipient.member_id.length === 0) {
-                throw new errors.BadRequestError({
-                    message: `Email ${email.id} has an unverifiable recipient ledger; reconcile it before continuing`
-                });
+            const recipientIds = recipientIdsByBatch.get(recipient?.batch_id);
+            const recipientEmails = recipientEmailsByBatch.get(recipient?.batch_id);
+            const recipientTuples = recipientTuplesByBatch.get(recipient?.batch_id);
+            if (!recipientIds || !recipientEmails || !recipientTuples || typeof recipient.member_id !== 'string' || recipient.member_id.length === 0 ||
+                typeof recipient.member_email !== 'string' || recipient.member_email.length === 0 ||
+                memberIds.has(recipient.member_id)) {
+                throw this.#partialResumeSafetyError(email);
             }
+            memberIds.add(recipient.member_id);
             recipientIds.push(recipient.member_id);
+            recipientEmails.push(recipient.member_email);
+            recipientTuples.push(`${recipient.batch_id}\u0000${recipient.member_id}\u0000${recipient.member_email}`);
+        }
+
+        const legacyBatchIds = legacyProof ? new Set(legacyProof.legacy_batch_ids) : new Set();
+        for (const batch of batches) {
+            const recipientIds = recipientIdsByBatch.get(batch.id);
+            if (!recipientIds) {
+                throw this.#partialResumeSafetyError(email);
+            }
+            if (legacyBatchIds.has(batch.id)) {
+                continue;
+            }
+            const actualManifest = this.#createRecipientManifest(recipientIds);
+            if (!this.#hasValidRecipientManifest(batch) || actualManifest.recipientCount !== Number(batch.get('recipient_count')) ||
+                actualManifest.recipientHash !== batch.get('recipient_hash')) {
+                throw this.#partialResumeSafetyError(email);
+            }
         }
 
         for (const batch of confirmedBatches) {
-            const expectedCount = Number(batch.get('recipient_count'));
-            const expectedHash = batch.get('recipient_hash');
-            const recipientIds = recipientIdsByBatch.get(batch.id);
-            if (!recipientIds) {
-                throw new errors.BadRequestError({
-                    message: `Email ${email.id} has an unverifiable provider-confirmed recipient ledger for batch ${batch.id}; reconcile it before continuing`
-                });
+            if (!legacyBatchIds.has(batch.id) && !this.#hasValidRecipientManifest(batch)) {
+                throw this.#partialResumeSafetyError(email);
             }
-            const actualManifest = this.#createRecipientManifest(recipientIds);
+        }
 
-            if (!Number.isSafeInteger(expectedCount) || expectedCount <= 0 ||
-                typeof expectedHash !== 'string' || !/^[a-f0-9]{64}$/.test(expectedHash) ||
-                actualManifest.recipientCount !== expectedCount ||
-                actualManifest.recipientHash !== expectedHash) {
-                throw new errors.BadRequestError({
-                    message: `Email ${email.id} has an unverifiable provider-confirmed recipient ledger for batch ${batch.id}; reconcile it before continuing`
-                });
+        if (legacyProof) {
+            const legacyMemberIds = [];
+            const legacyMemberEmails = [];
+            const legacyRecipientTuples = [];
+            for (const batchId of legacyProof.legacy_batch_ids) {
+                const recipientIds = recipientIdsByBatch.get(batchId);
+                const recipientEmails = recipientEmailsByBatch.get(batchId);
+                const recipientTuples = recipientTuplesByBatch.get(batchId);
+                if (!recipientIds || !recipientEmails || !recipientTuples) {
+                    throw this.#partialResumeSafetyError(email);
+                }
+                legacyMemberIds.push(...recipientIds);
+                legacyMemberEmails.push(...recipientEmails);
+                legacyRecipientTuples.push(...recipientTuples);
+            }
+            if (legacyMemberIds.length !== legacyProof.ledger_member_count ||
+                legacyMemberEmails.length !== legacyProof.ledger_email_count ||
+                hashStringList(legacyMemberIds) !== legacyProof.ledger_member_hash ||
+                hashStringList(legacyMemberEmails) !== legacyProof.ledger_email_hash ||
+                hashStringList(legacyRecipientTuples) !== legacyProof.ledger_binding_hash) {
+                throw this.#partialResumeSafetyError(email);
             }
         }
     }
@@ -714,7 +1140,7 @@ class BatchSendingService {
 
         members.forEach((memberRow) => {
             if (!memberRow.id || !memberRow.uuid || !memberRow.email) {
-                logging.warn(`Member row not included as email recipient due to missing data - id: ${memberRow.id}, uuid: ${memberRow.uuid}, email: ${memberRow.email}`);
+                logging.warn('Member row not included as email recipient because required recipient data was missing');
                 return;
             }
 
@@ -758,12 +1184,12 @@ class BatchSendingService {
         return batch;
     }
 
-    async sendBatches({email, batches, post, newsletter}) {
+    async sendBatches({email, batches, post, newsletter, emailSnapshot}) {
         // Track the in-flight call so onShutdown can await it. The cleanup task
         // must wait for the Mailgun POST + EmailBatch DB write to settle before
         // ghost-server schedules process.exit, otherwise mid-flight requests get
         // killed and EmailBatch rows never record what Mailgun actually accepted.
-        const work = this.#sendBatchesInner({email, batches, post, newsletter});
+        const work = this.#sendBatchesInner({email, batches, post, newsletter, emailSnapshot});
         this.#inFlight.add(work);
         try {
             return await work;
@@ -772,7 +1198,7 @@ class BatchSendingService {
         }
     }
 
-    async #sendBatchesInner({email, batches, post, newsletter}) {
+    async #sendBatchesInner({email, batches, post, newsletter, emailSnapshot}) {
         logging.info(`Sending ${batches.length} batches for email ${email.id}`);
         const deadline = this.getDeliveryDeadline(email);
 
@@ -802,7 +1228,7 @@ class BatchSendingService {
                 if (!batch) {
                     return;
                 }
-                const batchData = {email, batch, post, newsletter, emailBodyCache, deliveryTime: undefined};
+                const batchData = {email, batch, post, newsletter, emailSnapshot, emailBodyCache, deliveryTime: undefined};
                 if (shouldApplyDeliveryTimes) {
                     const deliveryTime = deliveryTimes.shift();
                     if (deliveryTime && deliveryTime >= Date.now()) {
@@ -841,10 +1267,10 @@ class BatchSendingService {
 
     /**
      *
-     * @param {{email: Email, batch: EmailBatch, post: Post, newsletter: Newsletter, emailBodyCache: Map<string, import('./email-renderer').EmailBody>, deliveryTime:(Date|undefined) }} data
+     * @param {{email: Email, batch: EmailBatch, post: Post, newsletter: Newsletter, emailSnapshot?: {subject: string, from: string, replyTo?: string}, emailBodyCache: Map<string, import('./email-renderer').EmailBody>, deliveryTime:(Date|undefined) }} data
      * @returns {Promise<boolean>} True when succeeded, false when failed with an error
      */
-    async sendBatch({email, batch: originalBatch, post, newsletter, emailBodyCache, deliveryTime}) {
+    async sendBatch({email, batch: originalBatch, post, newsletter, emailSnapshot, emailBodyCache, deliveryTime}) {
         logging.info(`Sending batch ${originalBatch.id} for email ${email.id}`);
 
         // Check the status of the email batch in a 'for update' transaction
@@ -902,7 +1328,8 @@ class BatchSendingService {
                     post,
                     newsletter,
                     segment: batch.get('member_segment'),
-                    members
+                    members,
+                    emailSnapshot
                 }, {
                     openTrackingEnabled: !!email.get('track_opens'),
                     clickTrackingEnabled: !!email.get('track_clicks'),
@@ -1019,13 +1446,19 @@ class BatchSendingService {
      * @param {string} status set the status of the model to this value
      * @param {string[]} allowedStatuses Check if the models current status is one of these values
      * @param {object} [data] Additional fields persisted atomically with the status transition
+     * @param {{expectedPartialResume?: boolean, expectedError?: string|null, expectedPartialResumeEnqueueClaim?: string|null}} [options] Additional predicates checked under the row lock
      * @returns {Promise<object|undefined>} The updated model. Undefined if the model didn't pass the status check.
      */
-    async updateStatusLock(Model, id, status, allowedStatuses, data = {}) {
+    async updateStatusLock(Model, id, status, allowedStatuses, data = {}, options = {}) {
+        const hasExpectedError = Object.prototype.hasOwnProperty.call(options, 'expectedError');
+        const hasExpectedPartialResumeEnqueueClaim = Object.prototype.hasOwnProperty.call(options, 'expectedPartialResumeEnqueueClaim');
         let model;
         await Model.transaction(async (transacting) => {
             model = await Model.findOne({id}, {require: true, transacting, forUpdate: true});
-            if (!allowedStatuses.includes(model.get('status'))) {
+            if (!allowedStatuses.includes(model.get('status')) ||
+                (options.expectedPartialResume !== undefined && model.get('partial_resume') !== options.expectedPartialResume) ||
+                (hasExpectedError && model.get('error') !== options.expectedError) ||
+                (hasExpectedPartialResumeEnqueueClaim && model.get('partial_resume_enqueue_claim') !== options.expectedPartialResumeEnqueueClaim)) {
                 model = undefined;
                 return;
             }

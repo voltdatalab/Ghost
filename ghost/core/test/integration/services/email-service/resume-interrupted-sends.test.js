@@ -9,6 +9,67 @@ const emailService = require('../../../../core/server/services/email-service');
 const {sendEmail} = require('../../../utils/batch-email-utils');
 const db = require('../../../../core/server/data/db');
 const ObjectID = require('bson-objectid').default;
+const crypto = require('node:crypto');
+const {canonicalizeLegacyProofPayload, hashStringList} = require('../../../../core/server/services/email-service/legacy-partial-resume-proof');
+
+function createLegacyProxyProof({emailId, batchIds, recipients, privateKey, issuedAt = new Date(Date.now() - 1000), proxyLastCreatedAt = new Date(Date.now() - 2000)}) {
+    const canonicalRecipientTuples = recipients.map(recipient => `${recipient.batch_id}\u0000${recipient.member_id}\u0000${recipient.member_email}`);
+    const payload = {
+        version: 1,
+        transport: 'ses-proxy-mailgun-v1',
+        email_id: emailId,
+        issued_at: issuedAt.toISOString(),
+        legacy_batch_ids: [...batchIds],
+        legacy_provider_id_mode: 'email-id',
+        ledger_member_count: recipients.length,
+        ledger_member_hash: hashStringList(recipients.map(recipient => recipient.member_id)),
+        ledger_email_count: recipients.length,
+        ledger_email_hash: hashStringList(recipients.map(recipient => recipient.member_email)),
+        ledger_binding_hash: hashStringList(canonicalRecipientTuples),
+        proxy_input_count: recipients.length,
+        proxy_input_hash: hashStringList(recipients.map(recipient => recipient.member_email)),
+        proxy_sent_count: recipients.length,
+        proxy_sent_hash: hashStringList(recipients.map(recipient => recipient.member_email)),
+        proxy_site_count: 1,
+        proxy_batch_count: batchIds.length,
+        proxy_first_created_at: proxyLastCreatedAt.toISOString(),
+        proxy_last_created_at: proxyLastCreatedAt.toISOString()
+    };
+    const {payloadJson} = canonicalizeLegacyProofPayload(payload);
+    return {
+        proof: payload,
+        signature: crypto.sign(null, Buffer.from(payloadJson, 'utf8'), privateKey).toString('base64url')
+    };
+}
+
+async function assertPersistedHeadersMatchSnapshot(emailModel) {
+    const newsletter = await emailModel.getLazyRelation('newsletter', {require: true});
+    const post = await emailModel.getLazyRelation('post', {require: true, withRelated: ['posts_meta', 'authors', 'tiers']});
+    const snapshot = post.clone();
+    snapshot.relations = {...post.relations};
+    const source = emailModel.get('source');
+    const sourceType = emailModel.get('source_type');
+    snapshot.set({
+        lexical: sourceType === 'lexical' ? source : null,
+        mobiledoc: sourceType === 'mobiledoc' ? source : null
+    });
+    assert.ok(emailModel.get('subject') === emailService.renderer.getSubject(snapshot, false), 'persisted subject must match the immutable snapshot');
+    assert.ok(emailModel.get('from') === emailService.renderer.getFromAddress(snapshot, newsletter, false), 'persisted from header must match the immutable snapshot');
+    assert.ok((emailModel.get('reply_to') ?? null) === (emailService.renderer.getReplyToAddress(snapshot, newsletter, false) ?? null), 'persisted reply-to header must match the immutable snapshot');
+}
+
+async function startPartialContinuationWithoutQueue(agent, emailModel) {
+    const addJob = sinon.stub(jobManager, 'addJob').resolves();
+    try {
+        await agent.put(`emails/${emailModel.id}/partial-resume`).expectStatus(200);
+        sinon.assert.calledOnce(addJob);
+    } finally {
+        addJob.restore();
+    }
+    await emailModel.refresh();
+    assert.equal(emailModel.get('partial_resume'), true);
+    assert.match(emailModel.get('partial_resume_render_hash'), /^[a-f0-9]{64}$/);
+}
 
 async function simulatePartiallyMaterializedEmail(emailModel) {
     const batches = (await models.EmailBatch.findAll({filter: `email_id:'${emailModel.id}'`})).models;
@@ -86,7 +147,7 @@ describe('Resume interrupted sends', function () {
         //    the other did; the parent email row is stuck in `submitting`.
         const [batchA, batchB] = batches;
         await batchB.save({status: 'pending', provider_id: null}, {patch: true, autoRefresh: false});
-        await emailModel.save({status: 'submitting'}, {patch: true, autoRefresh: false});
+        await emailModel.save({status: 'submitting', created_at: new Date(Date.now() - 60 * 1000)}, {patch: true, autoRefresh: false});
 
         // 3. Reset the Mailgun stub so we only count calls produced by the resume.
         const mailgunStub = mockManager.getMailgunCreateMessageStub();
@@ -112,6 +173,170 @@ describe('Resume interrupted sends', function () {
         sinon.assert.calledOnce(mailgunStub);
     });
 
+    it('admits a verified legacy prefix and resumes only the tail batches after proof admission', async function () {
+        configUtils.set('bulkEmail:batchSize', 1);
+        const keyPair = crypto.generateKeyPairSync('ed25519');
+        configUtils.set('bulkEmail:partialResume:legacyProxyPublicKey', keyPair.publicKey.export({type: 'spki', format: 'pem'}));
+
+        const {emailModel} = await sendEmail(agent);
+        const batches = (await models.EmailBatch.findAll({filter: `email_id:'${emailModel.id}'`})).models;
+        const recipients = (await models.EmailRecipient.findAll({filter: `email_id:'${emailModel.id}'`})).models;
+        assert.equal(batches.length, 4, 'batchSize=1 should materialize four batches for the 4-member fixture');
+        assert.equal(recipients.length, 4, 'fixture should materialize one recipient per batch');
+
+        const legacyBatches = batches.slice(0, 2);
+        const tailBatches = batches.slice(2);
+        const legacyBatchIds = legacyBatches.map(batch => batch.id);
+        const legacyRecipientRows = recipients
+            .filter(recipient => legacyBatchIds.includes(recipient.get('batch_id')))
+            .map(recipient => ({
+                batch_id: recipient.get('batch_id'),
+                member_id: recipient.get('member_id'),
+                member_email: recipient.get('member_email')
+            }));
+        assert.equal(legacyRecipientRows.length, 2, 'expected exactly two legacy recipient rows');
+
+        for (const batch of legacyBatches) {
+            await batch.save({status: 'submitted', provider_id: emailModel.id, recipient_count: null, recipient_hash: null}, {patch: true, autoRefresh: false});
+        }
+        for (const batch of tailBatches) {
+            await db.knex('email_recipients').where({batch_id: batch.id}).del();
+            await db.knex('email_batches').where({id: batch.id}).del();
+        }
+        await emailModel.save({status: 'submitted', partial_resume: false}, {patch: true, autoRefresh: false});
+
+        const signedProof = createLegacyProxyProof({
+            emailId: emailModel.id,
+            batchIds: legacyBatchIds,
+            recipients: legacyRecipientRows,
+            privateKey: keyPair.privateKey
+        });
+        const mailgunStub = mockManager.getMailgunCreateMessageStub();
+        mailgunStub.resetHistory();
+
+        await agent
+            .put(`emails/${emailModel.id}/partial-resume/legacy-proxy-proof`)
+            .body({id: emailModel.id, ...signedProof})
+            .expectStatus(200);
+        sinon.assert.notCalled(mailgunStub);
+
+        await agent
+            .put(`emails/${emailModel.id}/partial-resume/legacy-proxy-proof`)
+            .body({id: emailModel.id, ...signedProof})
+            .expectStatus(400);
+        sinon.assert.notCalled(mailgunStub);
+
+        const legacyProofRows = await db.knex('email_partial_resume_proofs')
+            .where({email_id: emailModel.id})
+            .select('email_id', 'proof_hash', 'transport');
+        assert.equal(legacyProofRows.length, 1);
+        assert.equal(legacyProofRows[0].email_id, emailModel.id);
+        assert.match(legacyProofRows[0].proof_hash, /^[a-f0-9]{64}$/);
+        assert.equal(legacyProofRows[0].transport, 'ses-proxy-mailgun-v1');
+
+        const completedPromise = jobManager.awaitCompletion('batch-sending-service-job');
+        await agent.put(`emails/${emailModel.id}/partial-resume`).expectStatus(200);
+        await completedPromise;
+
+        await emailModel.refresh();
+        assert.equal(emailModel.get('status'), 'submitted');
+        assert.equal(emailModel.get('partial_resume'), false);
+        assert.equal(emailModel.get('email_count'), 4);
+
+        const finalBatches = (await models.EmailBatch.findAll({filter: `email_id:'${emailModel.id}'`})).models;
+        assert.equal(finalBatches.length, 4);
+        const refreshedLegacyBatches = finalBatches.filter(batch => legacyBatchIds.includes(batch.id));
+        assert.equal(refreshedLegacyBatches.length, 2);
+        for (const batch of refreshedLegacyBatches) {
+            assert.equal(batch.get('status'), 'submitted');
+            assert.equal(batch.get('provider_id'), emailModel.id);
+            assert.equal(batch.get('recipient_count'), null);
+            assert.equal(batch.get('recipient_hash'), null);
+        }
+
+        const refreshedTailBatches = finalBatches.filter(batch => !legacyBatchIds.includes(batch.id));
+        assert.equal(refreshedTailBatches.length, 2);
+        for (const batch of refreshedTailBatches) {
+            assert.equal(batch.get('status'), 'submitted');
+            assert.equal(batch.get('provider_id'), 'stubbed-email-id');
+            assert.equal(batch.get('recipient_count'), 1);
+            assert.match(batch.get('recipient_hash'), /^[a-f0-9]{64}$/);
+        }
+
+        const finalRecipients = (await models.EmailRecipient.findAll({filter: `email_id:'${emailModel.id}'`})).models;
+        assert.equal(finalRecipients.length, 4);
+        assert.equal(new Set(finalRecipients.map(recipient => `${recipient.get('email_id')}\u0000${recipient.get('member_id')}`)).size, 4, 'recipient ledger must stay unique by (email_id, member_id)');
+        assert.equal(new Set(finalRecipients.map(recipient => recipient.get('member_id'))).size, 4, 'recipient ledger must stay unique by member_id');
+        sinon.assert.calledTwice(mailgunStub);
+    });
+
+    it('blocks a legacy tuple swap even after proof admission', async function () {
+        configUtils.set('bulkEmail:batchSize', 1);
+        const keyPair = crypto.generateKeyPairSync('ed25519');
+        configUtils.set('bulkEmail:partialResume:legacyProxyPublicKey', keyPair.publicKey.export({type: 'spki', format: 'pem'}));
+
+        const {emailModel} = await sendEmail(agent);
+        const batches = (await models.EmailBatch.findAll({filter: `email_id:'${emailModel.id}'`})).models;
+        const recipients = (await models.EmailRecipient.findAll({filter: `email_id:'${emailModel.id}'`})).models;
+        const legacyBatches = batches.slice(0, 2);
+        const tailBatches = batches.slice(2);
+        const legacyBatchIds = legacyBatches.map(batch => batch.id);
+        const legacyRecipientRows = recipients
+            .filter(recipient => legacyBatchIds.includes(recipient.get('batch_id')))
+            .map(recipient => ({
+                batch_id: recipient.get('batch_id'),
+                member_id: recipient.get('member_id'),
+                member_email: recipient.get('member_email')
+            }));
+
+        for (const batch of legacyBatches) {
+            await batch.save({status: 'submitted', provider_id: emailModel.id, recipient_count: null, recipient_hash: null}, {patch: true, autoRefresh: false});
+        }
+        for (const batch of tailBatches) {
+            await db.knex('email_recipients').where({batch_id: batch.id}).del();
+            await db.knex('email_batches').where({id: batch.id}).del();
+        }
+        await emailModel.save({status: 'submitted', partial_resume: false}, {patch: true, autoRefresh: false});
+        // The shared fixture may reuse an address. Give the two signed recipients
+        // distinct synthetic addresses so swapping their member/email pairs is a
+        // real binding mutation rather than a no-op.
+        legacyRecipientRows[0].member_email = 'legacy-swap-a@example.test';
+        legacyRecipientRows[1].member_email = 'legacy-swap-b@example.test';
+        for (const recipient of legacyRecipientRows) {
+            await db.knex('email_recipients').where({email_id: emailModel.id, batch_id: recipient.batch_id, member_id: recipient.member_id}).update({member_email: recipient.member_email});
+        }
+
+        const signedProof = createLegacyProxyProof({
+            emailId: emailModel.id,
+            batchIds: legacyBatchIds,
+            recipients: legacyRecipientRows,
+            privateKey: keyPair.privateKey
+        });
+        const mailgunStub = mockManager.getMailgunCreateMessageStub();
+        mailgunStub.resetHistory();
+
+        await agent.put(`emails/${emailModel.id}/partial-resume/legacy-proxy-proof`).body({id: emailModel.id, ...signedProof}).expectStatus(200);
+        const firstLegacyRecipient = legacyRecipientRows.find(recipient => recipient.batch_id === legacyBatches[0].id);
+        const secondLegacyRecipient = legacyRecipientRows.find(recipient => recipient.batch_id === legacyBatches[1].id);
+        await db.knex('email_recipients').where({email_id: emailModel.id, batch_id: legacyBatches[0].id}).update({member_email: secondLegacyRecipient.member_email});
+        await db.knex('email_recipients').where({email_id: emailModel.id, batch_id: legacyBatches[1].id}).update({member_email: firstLegacyRecipient.member_email});
+        const swappedRows = await db.knex('email_recipients').where({email_id: emailModel.id}).whereIn('batch_id', legacyBatchIds).select('batch_id', 'member_email');
+        assert.equal(swappedRows.find(row => row.batch_id === legacyBatches[0].id).member_email, secondLegacyRecipient.member_email);
+        assert.equal(swappedRows.find(row => row.batch_id === legacyBatches[1].id).member_email, firstLegacyRecipient.member_email);
+        const originalTuples = legacyRecipientRows.map(recipient => `${recipient.batch_id}\u0000${recipient.member_id}\u0000${recipient.member_email}`).sort();
+        const swappedTuples = swappedRows.map(row => `${row.batch_id}\u0000${legacyRecipientRows.find(recipient => recipient.batch_id === row.batch_id).member_id}\u0000${row.member_email}`).sort();
+        assert.notDeepEqual(swappedTuples, originalTuples);
+        const swappedBindingHash = hashStringList(swappedTuples);
+        assert.notEqual(swappedBindingHash, signedProof.proof.ledger_binding_hash);
+
+        await agent.put(`emails/${emailModel.id}/partial-resume`).expectStatus(400);
+        sinon.assert.notCalled(mailgunStub);
+
+        const remainingBatches = (await models.EmailBatch.findAll({filter: `email_id:'${emailModel.id}'`})).models;
+        assert.equal(remainingBatches.length, 2, 'tuple swap must block before any tail materialization');
+        assert.equal(new Set((await models.EmailRecipient.findAll({filter: `email_id:'${emailModel.id}'`})).models.map(recipient => `${recipient.get('batch_id')}\u0000${recipient.get('member_id')}\u0000${recipient.get('member_email')}`)).size, 2);
+    });
+
     it('marks email as failed when an orphan submitting batch is encountered', async function () {
         // Same setup, but this time one of the batches is left as `submitting` — the orphan
         // state a crashed worker leaves behind. The (b) short-circuit fix should refuse to
@@ -127,7 +352,7 @@ describe('Resume interrupted sends', function () {
         // batchB: flipped to submitting (orphan from crash) — provider_id intentionally preserved
         //          so the breadcrumb in the runbook still cross-references against Mailgun.
         await batchB.save({status: 'submitting'}, {patch: true, autoRefresh: false});
-        await emailModel.save({status: 'submitting'}, {patch: true, autoRefresh: false});
+        await emailModel.save({status: 'submitting', created_at: new Date(Date.now() - 60 * 1000)}, {patch: true, autoRefresh: false});
 
         const mailgunStub = mockManager.getMailgunCreateMessageStub();
         mailgunStub.resetHistory();
@@ -166,6 +391,7 @@ describe('Resume interrupted sends', function () {
     it('continues only the missing recipients and rejects a repeated continuation', async function () {
         const {emailModel} = await sendEmail(agent);
         const {confirmedBatch} = await simulatePartiallyMaterializedEmail(emailModel);
+        await assertPersistedHeadersMatchSnapshot(emailModel);
 
         const mailgunStub = mockManager.getMailgunCreateMessageStub();
         mailgunStub.resetHistory();
@@ -204,7 +430,8 @@ describe('Resume interrupted sends', function () {
     it('retries a safe failed continuation only through the explicit partial route', async function () {
         const {emailModel} = await sendEmail(agent);
         await simulatePartiallyMaterializedEmail(emailModel);
-        await emailModel.save({status: 'failed', partial_resume: true, error: 'simulated interruption'}, {patch: true, autoRefresh: false});
+        await startPartialContinuationWithoutQueue(agent, emailModel);
+        await emailModel.save({status: 'failed', partial_resume: true, partial_resume_enqueue_claim: null, error: 'simulated interruption'}, {patch: true, autoRefresh: false});
 
         const mailgunStub = mockManager.getMailgunCreateMessageStub();
         mailgunStub.resetHistory();
@@ -225,9 +452,11 @@ describe('Resume interrupted sends', function () {
     it('re-enters the partial continuation path after a boot-time restart', async function () {
         const {emailModel} = await sendEmail(agent);
         await simulatePartiallyMaterializedEmail(emailModel);
+        await startPartialContinuationWithoutQueue(agent, emailModel);
         await db.knex('emails').where({id: emailModel.id}).update({
             status: 'submitting',
             partial_resume: true,
+            partial_resume_enqueue_claim: null,
             updated_at: new Date(Date.now() - 60 * 60 * 1000)
         });
 
@@ -250,9 +479,11 @@ describe('Resume interrupted sends', function () {
     it('recovers a partial continuation stranded between its state lock and its in-memory job', async function () {
         const {emailModel} = await sendEmail(agent);
         await simulatePartiallyMaterializedEmail(emailModel);
+        await startPartialContinuationWithoutQueue(agent, emailModel);
         await db.knex('emails').where({id: emailModel.id}).update({
             status: 'pending',
             partial_resume: true,
+            partial_resume_enqueue_claim: null,
             updated_at: new Date(Date.now() - 60 * 60 * 1000)
         });
 
@@ -274,6 +505,7 @@ describe('Resume interrupted sends', function () {
     it('recovers a newly-started partial continuation for an older campaign', async function () {
         const {emailModel} = await sendEmail(agent);
         await simulatePartiallyMaterializedEmail(emailModel);
+        await startPartialContinuationWithoutQueue(agent, emailModel);
 
         // The original campaign can be older than the general resume window. A
         // continuation initiated now must be aged from its state transition, not
@@ -283,6 +515,7 @@ describe('Resume interrupted sends', function () {
         await db.knex('emails').where({id: emailModel.id}).update({
             status: 'pending',
             partial_resume: true,
+            partial_resume_enqueue_claim: null,
             created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
             updated_at: transitionAt
         });
@@ -310,9 +543,11 @@ describe('Resume interrupted sends', function () {
     it('claims a pre-boot partial continuation once across overlapping scanner calls', async function () {
         const {emailModel} = await sendEmail(agent);
         await simulatePartiallyMaterializedEmail(emailModel);
+        await startPartialContinuationWithoutQueue(agent, emailModel);
         await db.knex('emails').where({id: emailModel.id}).update({
             status: 'pending',
             partial_resume: true,
+            partial_resume_enqueue_claim: null,
             updated_at: new Date(Date.now() - 60 * 60 * 1000)
         });
 
@@ -446,7 +681,7 @@ describe('Resume interrupted sends', function () {
     it('marks email as failed when the parent post is no longer published', async function () {
         // Scanner check: post.status !== 'published'/'sent' -> flip email to failed and skip the resume.
         const {emailModel} = await sendEmail(agent);
-        await emailModel.save({status: 'submitting'}, {patch: true, autoRefresh: false});
+        await emailModel.save({status: 'submitting', created_at: new Date(Date.now() - 60 * 1000)}, {patch: true, autoRefresh: false});
 
         // Unpublish the post by setting it back to draft.
         const post = await emailModel.getLazyRelation('post');

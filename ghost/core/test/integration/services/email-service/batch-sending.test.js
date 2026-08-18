@@ -187,7 +187,7 @@ describe('Batch sending tests', function () {
 
     it('Protects the email job from being run multiple times at the same time', async function () {
         // The lock means only one job wins; every other concurrent attempt hits
-        // the "not pending or failed" guard and logs an expected error. Stub the
+        // the "not pending" guard and logs an expected error. Stub the
         // logger so we can assert that guard fired instead of spamming stdout.
         const errorLog = sinon.stub(logging, 'error');
 
@@ -229,8 +229,8 @@ describe('Batch sending tests', function () {
         // config, an unrelated transient failure elsewhere in the same window
         // would log a non-string Error object and crash assert.match instead of
         // failing the assertion cleanly.
-        const guardLogs = errorLog.getCalls().filter(call => typeof call.args[0] === 'string' && /Tried sending email that is not pending or failed/.test(call.args[0]));
-        assert.ok(guardLogs.length > 0, 'expected at least one "not pending or failed" guard error log');
+        const guardLogs = errorLog.getCalls().filter(call => typeof call.args[0] === 'string' && /Tried sending email that is not pending/.test(call.args[0]));
+        assert.ok(guardLogs.length > 0, 'expected at least one "not pending" guard error log');
     });
 
     it('Doesn\'t include members created after the email in the batches', async function () {
